@@ -291,6 +291,7 @@ function signalListForSaveFile(rowIdList: RowId[]): any[] {
       numberFormat:     data.valueFormat.id,
       colorIndex:       data.colorIndex,
       rowHeight:        data.rowHeight,
+      verticalScale:    data.verticalScale,
       renderType:       data.renderType.id,
       valueLinkCommand: data.valueLinkCommand,
     });
@@ -722,10 +723,16 @@ class VaporviewWebview {
     this.events.dispatch(ActionType.ReorderSignals, rowId, parentGroupId, newIndex);
   }
 
-  updateVerticalScale(rowId: RowId | null, scale: number) {
+  updateVerticalScale(event: any, scale: number) {
+    let rowId = viewerState.selectedSignal;
+    if (event && event.netlistId !== undefined) {
+      rowId = dataManager.netlistIdTable[event.netlistId];
+    }
     if (rowId === null) {return;}
     const netlistData = dataManager.rowItems[rowId];
     if (!(netlistData instanceof VariableItem)) {return;}
+    const renderType = netlistData.renderType.id;
+    if (renderType === "multiBit" || renderType === "binary") {return;}
     netlistData.verticalScale = Math.max(1, netlistData.verticalScale * scale);
     this.events.dispatch(ActionType.RedrawVariable, rowId);
   }
@@ -735,8 +742,9 @@ class VaporviewWebview {
       case 'nextEdge': {controlBar.goToNextTransition(1, []); break;}
       case 'previousEdge': {controlBar.goToNextTransition(-1, []); break;}
       case 'zoomToFit': {this.events.dispatch(ActionType.Zoom, Infinity, 0, 0); break;}
-      case 'increaseVerticalScale': {this.updateVerticalScale(viewerState.selectedSignal, 2); break;}
-      case 'decreaseVerticalScale': {this.updateVerticalScale(viewerState.selectedSignal, 0.5); break;}
+      case 'increaseVerticalScale': {this.updateVerticalScale(e.event, 2); break;}
+      case 'decreaseVerticalScale': {this.updateVerticalScale(e.event, 0.5); break;}
+      case 'resetVerticalScale':    {this.updateVerticalScale(e.event, 0); break;}
       case 'delete': {this.removeVariableInternal(null); break;}
       case 'backspace': {this.removeVariableInternal(null); break;}
       case 'selectAll': {
@@ -769,7 +777,7 @@ class VaporviewWebview {
   }
 
   handleMouseUp(event: MouseEvent | KeyboardEvent, abort: boolean) {
-    console.log('mouseup event type: ' + event);
+    //console.log('mouseup event type: ' + viewerState.mouseupEventType);
     if (viewerState.mouseupEventType === 'rearrange') {
       labelsPanel.dragEnd(event, abort);
     } else if (viewerState.mouseupEventType === 'dragAndDrop') {

@@ -117,17 +117,19 @@ export class WaveformDataManager {
     if (signalList.length === 0) {return;}
 
     let updateFlag     = false;
-    let selectedSignal = viewerState.selectedSignal;
+    //let selectedSignal = viewerState.selectedSignal;
     const signalIdList: any  = [];
     const netlistIdList: any = [];
     const rowIdList: any     = [];
     const moveList: any      = [];
+    let lastRowId: number | null = null;
 
     signalList.forEach((signal: any) => {
 
       const netlistId = signal.netlistId;
       const signalId  = signal.signalId;
       let rowId       = this.nextRowId;
+      lastRowId       = rowId;
 
       if (this.netlistIdTable[netlistId] === undefined) {
         this.netlistIdTable[netlistId] = rowId;
@@ -159,7 +161,7 @@ export class WaveformDataManager {
       netlistIdList.push(netlistId);
 
       if (this.valueChangeData[signalId] !== undefined) {
-        selectedSignal = rowId;
+        //selectedSignal = [rowId];
         updateFlag     = true;
         varItem.cacheValueFormat();
       } else if (this.valueChangeDataTemp[signalId] !== undefined) {
@@ -201,7 +203,7 @@ export class WaveformDataManager {
       });
     }
 
-    this.events.dispatch(ActionType.SignalSelect, selectedSignal);
+    this.events.dispatch(ActionType.SignalSelect, rowIdList, lastRowId);
     sendWebviewContext();
   }
 
@@ -249,13 +251,16 @@ export class WaveformDataManager {
   }
 
   renameSignalGroup(groupId: number | undefined, name: string | undefined) {
-    let rowId: number;
-    if (groupId) {
+    let rowId: number | undefined;
+    if (groupId !== undefined) {
       rowId = this.groupIdTable[groupId];
       if (rowId === undefined) {return;}
-    }
-    else {
-      if (viewerState.selectedSignal && viewerState.selectedSignal >= 0) {
+    } else {
+      // Prefer single multi-selection if present; otherwise use single selection
+      const selMulti = viewerState.selectedSignals;
+      if (Array.isArray(selMulti) && selMulti.length === 1 && selMulti[0] >= 0) {
+        rowId = selMulti[0];
+      } else if (viewerState.selectedSignal !== null && viewerState.selectedSignal >= 0) {
         rowId = viewerState.selectedSignal;
       } else {
         return;
@@ -514,10 +519,16 @@ export class WaveformDataManager {
   }
 
   getTransitionCount(): number | null {
-  const result = null;
-    if (viewerState.selectedSignal === null) {return result;}
+    const result = null;
+    // Determine a single selected rowId, supporting both single and multi-select
+    let rowId: RowId | null = null;
+    if (viewerState.selectedSignal !== null) {
+      rowId = viewerState.selectedSignal as RowId;
+    } else if (Array.isArray(viewerState.selectedSignals) && viewerState.selectedSignals.length === 1) {
+      rowId = viewerState.selectedSignals[0];
+    }
+    if (rowId === null) {return result;}
     if (viewerState.markerTime === null || viewerState.altMarkerTime === null) {return result;}
-    const rowId = viewerState.selectedSignal;
     const netlistData = this.rowItems[rowId];
     if (netlistData instanceof VariableItem === false) {return result;}
     const signalId = netlistData.signalId;
@@ -670,6 +681,7 @@ export class WaveformDataManager {
       if (netlistData.renderType.id === "multiBit") {
         netlistData.cacheValueFormat();
       }
+      netlistData.setSignalContextAttribute();
     }
 
     if (message.rowHeight !== undefined) {
