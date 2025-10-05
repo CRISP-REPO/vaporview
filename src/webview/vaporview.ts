@@ -235,6 +235,28 @@ export function revealSignal(rowId: RowId) {
   }
 }
 
+export function handleClickSelection(event: MouseEvent, rowId: RowId) {
+  let newSelection: RowId[] = [rowId];
+  if (viewerState.selectedSignal.length === 0 || viewerState.lastSelectedSignal === null) {
+    // No existing selection, just select the clicked row
+  }
+  else if (event.shiftKey) {
+    const lastSelectedIndex = viewerState.visibleSignalsFlat.indexOf(viewerState.lastSelectedSignal);
+    const clickedIndex      = viewerState.visibleSignalsFlat.indexOf(rowId);
+    const startIndex        = Math.min(lastSelectedIndex, clickedIndex);
+    const endIndex          = Math.max(lastSelectedIndex, clickedIndex);
+    const addedSignals      = viewerState.visibleSignalsFlat.slice(startIndex, endIndex + 1).filter(id => !viewerState.selectedSignal.includes(id));
+    newSelection            = viewerState.selectedSignal.concat(addedSignals);
+  } else if (event.ctrlKey || event.metaKey) {
+    if (viewerState.selectedSignal.includes(rowId)) {
+      newSelection = viewerState.selectedSignal.filter(id => id !== rowId);
+    } else {
+      newSelection = viewerState.selectedSignal.concat([rowId]);
+    }
+  }
+  events.dispatch(ActionType.SignalSelect, newSelection, rowId);
+}
+
 export const WAVE_HEIGHT = parseInt(window.getComputedStyle(document.body).getPropertyValue('--waveform-height'));
 
 export function getRowHeightCssClass(height: number) {
@@ -743,12 +765,14 @@ class VaporviewWebview {
   }
 
   handleReorderArrowKeys(direction: number) {
+
     if (viewerState.selectedSignal.length !== 1) {return;}
     const rowId = viewerState.selectedSignal[0];
     if (rowId === null) {return;}
     let parentGroupId = getParentGroupId(rowId);
     let parentList: RowId[] = [];
     if (parentGroupId === null) {return;}
+    console.log('handleReorderArrowKeys: ' + direction);
     if (parentGroupId === 0) {
       parentList = viewerState.displayedSignals;
     } else {
@@ -785,10 +809,13 @@ class VaporviewWebview {
             newIndex = adjacentGroup.children.length;
           }
         }
+      // not sure why, but we need to increment the index if moving down
+      } else if (direction > 0) {
+        newIndex += 1;
       }
     }
 
-    this.events.dispatch(ActionType.ReorderSignals, rowId, parentGroupId, newIndex);
+    this.events.dispatch(ActionType.ReorderSignals, [rowId], parentGroupId, newIndex);
   }
 
   updateVerticalScale(event: any, scale: number) {
@@ -917,13 +944,16 @@ class VaporviewWebview {
   }
 
   // #region Global Events
-  reorderSignals(rowId: number, newGroupId: number, newIndex: number) {
-    {
-      const list = (viewerState.selectedSignals && viewerState.selectedSignals.length > 0)
-        ? [...viewerState.selectedSignals]
-        : [rowId];
-      this.events.dispatch(ActionType.SignalSelect, list, rowId);
-    }
+  reorderSignals(rowIdList: number[], newGroupId: number, newIndex: number) {
+    // Keep selection consistent prior to performing the move. If nothing is selected,
+    // default to the rows being reordered. Preserve focused row for single-item moves.
+    const list = (viewerState.selectedSignals && viewerState.selectedSignals.length > 0)
+      ? [...viewerState.selectedSignals]
+      : [...rowIdList];
+    const lastSelectedRowId: RowId | null = (rowIdList.length === 1)
+      ? rowIdList[0]
+      : viewerState.lastSelectedSignal;
+    this.events.dispatch(ActionType.SignalSelect, list, lastSelectedRowId);
   }
 
   handleResizeViewer() {
@@ -945,20 +975,24 @@ class VaporviewWebview {
 
   handleSignalSelect(rowIdList: RowId[], lastSelected: RowId | null = null) {
     if (!Array.isArray(rowIdList)) {return;}
+    const filteredRowIdList = dataManager.removeChildrenFromSignalList(rowIdList);
+    console.log('handleSignalSelect:', filteredRowIdList);
+    if (filteredRowIdList.length === 0) {return;}
+
     // Update selection state
-    viewerState.selectedSignal = rowIdList;
-    viewerState.selectedSignals = rowIdList;
+    viewerState.selectedSignal = filteredRowIdList;
+    viewerState.selectedSignals = filteredRowIdList;
     viewerState.lastSelectedSignal = lastSelected;
     viewerState.selectedSignalIndex = (lastSelected !== null)
       ? viewerState.visibleSignalsFlat.indexOf(lastSelected)
       : null;
 
     sendWebviewContext();
-    if (rowIdList.length > 0) {
-      revealSignal(rowIdList[0]);
+    if (filteredRowIdList.length > 0) {
+      revealSignal(filteredRowIdList[0]);
     }
 
-    if (lastSelected === null) {return;}
+  if (lastSelected === null) {return;}
     const netlistData = dataManager.rowItems[lastSelected];
     if (!(netlistData instanceof VariableItem)) {return;}
     let instancePath = netlistData.scopePath + '.' + netlistData.signalName;
@@ -1338,7 +1372,7 @@ class VaporviewWebview {
       case 'remove-group':          {this.removeSignalGroup(message.groupId, message.recursive); break;}
       case 'update-waveform-chunk': {dataManager.updateWaveformChunk(message); break;}
       case 'update-waveform-chunk-compressed': {dataManager.updateWaveformChunkCompressed(message); break;}
-      case 'newSignalGroup':        {dataManager.addSignalGroup(message.groupName, message.groupPath, message.parentGroupId); break;}
+      case 'newSignalGroup':        {dataManager.addSignalGroup(message.groupName, message.groupPath, message.parentGroupId, message.eventRowId); break;}
       case 'renameSignalGroup':     {dataManager.renameSignalGroup(message.groupId, message.groupName); break;}
       case 'handle-keypress':       {this.externalKeyDownHandler(message); break;}
       case 'setDisplayFormat':      {dataManager.setDisplayFormat(message); break;}

@@ -1,4 +1,4 @@
-import { vscode, WaveformData, arrayMove, sendWebviewContext, SignalId, ValueChange, ActionType, EventHandler, viewerState, dataManager, restoreState, RowId, updateDisplayedSignalsFlat, WAVE_HEIGHT } from "./vaporview";
+import { vscode, WaveformData, arrayMove, sendWebviewContext, SignalId, ValueChange, ActionType, EventHandler, viewerState, dataManager, restoreState, RowId, updateDisplayedSignalsFlat, WAVE_HEIGHT, handleClickSelection } from "./vaporview";
 import { ValueFormat } from './value_format';
 import { WaveformRenderer, multiBitWaveformRenderer, binaryWaveformRenderer } from './renderer';
 import { labelsPanel } from "./vaporview";
@@ -81,6 +81,7 @@ export class Viewport {
   // CSS Properties
   colorKey: string[]          = ['green', 'orange', 'blue', 'purple'];
   xzColor: string             = 'red';
+  textColor: string           = 'white';
   rulerTextColor: string      = 'grey';
   rulerGuideColor: string     = 'grey';
   edgeGuideColor: string      = 'orange';
@@ -150,8 +151,7 @@ export class Viewport {
     this.handleZoom = this.handleZoom.bind(this);
     this.handleSignalSelect = this.handleSignalSelect.bind(this);
     this.handleMarkerSet = this.handleMarkerSet.bind(this);
-    //this.handleReorderSignals = this.handleReorderSignals.bind(this);
-    this.handleReorderSignalsHierarchy = this.handleReorderSignalsHierarchy.bind(this);
+    this.handleReorderSignals = this.handleReorderSignals.bind(this);
     this.highlightZoom = this.highlightZoom.bind(this);
     this.drawHighlightZoom = this.drawHighlightZoom.bind(this);
     this.handleRemoveVariable = this.handleRemoveVariable.bind(this);
@@ -162,8 +162,7 @@ export class Viewport {
     this.events.subscribe(ActionType.MarkerSet, this.handleMarkerSet);
     this.events.subscribe(ActionType.SignalSelect, this.handleSignalSelect);
     this.events.subscribe(ActionType.Zoom, this.handleZoom);
-    //this.events.subscribe(ActionType.ReorderSignals, this.handleReorderSignals);
-    this.events.subscribe(ActionType.ReorderSignals, this.handleReorderSignalsHierarchy);
+    this.events.subscribe(ActionType.ReorderSignals, this.handleReorderSignals);
     this.events.subscribe(ActionType.AddVariable, this.handleAddVariable);
     this.events.subscribe(ActionType.RemoveVariable, this.handleRemoveVariable);
     this.events.subscribe(ActionType.RedrawVariable, this.handleRedrawSignal);
@@ -213,6 +212,9 @@ export class Viewport {
 
     // Non-2-State Signal Color
     this.xzColor = style.getPropertyValue('--vscode-debugTokenExpression-error');
+
+    // Text Color
+    this.textColor = style.getPropertyValue('--vscode-editor-foreground');
 
     // Ruler Color
     this.rulerTextColor = style.getPropertyValue('--vscode-editorLineNumber-foreground');
@@ -433,10 +435,7 @@ export class Viewport {
     }
 
     if (button === 0) {
-      const list = (viewerState.selectedSignals && viewerState.selectedSignals.length > 0)
-        ? [...viewerState.selectedSignals]
-        : [rowId];
-      this.events.dispatch(ActionType.SignalSelect, list, rowId);
+      handleClickSelection(event, rowId);
     }
   }
 
@@ -601,9 +600,7 @@ export class Viewport {
     } catch(_err) { /* noop */ }
   }
 
-  handleReorderSignalsHierarchy(rowId: number, newGroupId: number, newIndex: number) {
-
-    updateDisplayedSignalsFlat();
+  handleReorderSignals(rowIdList: number[], newGroupId: number, newIndex: number) {
     this.updateSignalOrder();
   }
 
@@ -674,6 +671,10 @@ export class Viewport {
       const el = document.getElementById('waveform-' + rid);
       if (el) {el.classList.remove('is-selected');}
     });
+    if (viewerState.lastSelectedSignal !== null) {
+      const element = document.getElementById('waveform-' + viewerState.lastSelectedSignal);
+      if (element) {element.classList.remove('last-selected');}
+    }
 
     // Update selection state
     viewerState.selectedSignal = rowIdList;
@@ -685,6 +686,11 @@ export class Viewport {
       const el = document.getElementById('waveform-' + rid);
       if (el) {el.classList.add('is-selected');}
     });
+
+    if (lastSelected !== null) {
+      const element = document.getElementById('waveform-' + lastSelected);
+      if (element) {element.classList.add('last-selected');}
+    }
   }
 
   logScaleFromUnits(unit: string | undefined) {

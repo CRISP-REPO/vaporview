@@ -50,6 +50,7 @@ export interface RowItem {
   createValueDisplayElement(): string;
   createViewportElement(rowId: number): void;
   setSignalContextAttribute(): void;
+  getLabelText(): string;
   getValueAtTime(time: number): string[];
   getFlattenedRowIdList(ignoreCollapsed: boolean, ignoreRowId: number): number[];
   rowIdCount(ignoreCollapsed: boolean, stopIndex: number): number
@@ -73,7 +74,7 @@ export class VariableItem extends SignalItem implements RowItem {
   public color: string = "";
   public rowHeight: number = 1;
   public formattedValues: string[] = [];
-  public formatValid: boolean = false;
+  public formatCached: boolean = false;
   public wasRendered: boolean = false;
   public canvas: HTMLCanvasElement | null = null;
   public ctx: CanvasRenderingContext2D | null = null;
@@ -106,11 +107,13 @@ export class VariableItem extends SignalItem implements RowItem {
   public createLabelElement() {
 
     const rowId         = dataManager.netlistIdTable[this.netlistId];
-    const selectorClass = this.isSelected ? 'is-selected' : '';
     const height        = getRowHeightCssClass(this.rowHeight);
     const signalName    = htmlSafe(this.signalName);
     const scopePath     = htmlSafe(this.scopePath + '.');
     const fullPath      = htmlAttributeSafe(scopePath + signalName);
+    const isSelectedClass   = this.isSelected ? 'is-selected' : '';
+    const lastSelectedClass = viewerState.lastSelectedSignal === rowId ? 'last-selected' : '';
+    const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
     const tooltip       = "Name: " + fullPath + "\nType: " + this.variableType + "\nWidth: " + this.signalWidth + "\nEncoding: " + this.encoding;
     return `<div class="waveform-label is-idle" id="label-${rowId}" title="${tooltip}" data-vscode-context=${this.vscodeContext}>
               <div class='waveform-row ${selectorClass} ${height}'>
@@ -123,7 +126,9 @@ export class VariableItem extends SignalItem implements RowItem {
     const rowId = dataManager.netlistIdTable[this.netlistId];
     let   value = labelsPanel.valueAtMarker[rowId];
     if (value === undefined) {value = [];}
-    const selectorClass = this.isSelected ? 'is-selected' : 'is-idle';
+    const isSelectedClass   = this.isSelected ? 'is-selected' : '';
+    const lastSelectedClass = viewerState.lastSelectedSignal === rowId ? 'last-selected' : '';
+    const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
     const height        = getRowHeightCssClass(this.rowHeight);
     const joinString    = '<p style="color:var(--vscode-foreground)">-></p>';
     const parseValue    = this.valueFormat.formatString;
@@ -170,8 +175,13 @@ export class VariableItem extends SignalItem implements RowItem {
       preventDefaultContextMenuItems: true,
       commandValid: this.valueLinkCommand !== "",
       netlistId: this.netlistId,
+      rowId: dataManager.netlistIdTable[this.netlistId],
       isAnalog: isAnalog,
     }).replace(/\s/g, '%x20')}`;
+  }
+
+  public getLabelText(): string {
+    return [this.scopePath + this.signalName].join('.');
   }
 
   public getFlattenedRowIdList(ignoreCollapsed: boolean, ignoreRowId: number): number[] {
@@ -293,13 +303,13 @@ export class VariableItem extends SignalItem implements RowItem {
       const valueChangeData = dataManager.valueChangeData[this.signalId];
       if (valueChangeData === undefined)     {resolve(); return;}
       if (this.renderType.id !== "multiBit") {resolve(); return;}
-      if (this.formatValid)                  {resolve(); return;}
+      if (this.formatCached)                 {resolve(); return;}
 
       this.formattedValues = valueChangeData.transitionData.map(([, value]) => {
         const is9State = this.valueFormat.is9State(value);
         return this.valueFormat.formatString(value, this.signalWidth, !is9State);
       });
-      this.formatValid = true;
+      this.formatCached = true;
       resolve();
       return;
     });
@@ -486,7 +496,9 @@ export class SignalGroup extends SignalItem implements RowItem {
       icon = 'codicon-chevron-down';
       groupClass = 'expanded-group';
     }
-    const selectorClass = this.isSelected ? 'is-selected' : '';
+    const isSelectedClass   = this.isSelected ? 'is-selected' : '';
+    const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
+    const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
     //const tooltip       = "Name: " + fullPath + "\nType: " + this.variableType + "\nWidth: " + this.signalWidth + "\nEncoding: " + this.encoding;
     return `<div class="waveform-label waveform-group is-idle ${groupClass}" id="label-${this.rowId}" data-vscode-context=${this.vscodeContext}>
               <div class="waveform-row ${selectorClass} height1x">${this.createWaveformRowContent()}</div>
@@ -497,7 +509,9 @@ export class SignalGroup extends SignalItem implements RowItem {
   public createValueDisplayElement() {
 
     let   value = labelsPanel.valueAtMarker[this.rowId];
-    const selectorClass = this.isSelected ? 'is-selected' : '';
+    const isSelectedClass   = this.isSelected ? 'is-selected' : '';
+    const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
+    const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
     let result = `<div class="value-display-item ${selectorClass} height1x" id="value-${this.rowId}" data-vscode-context=${this.vscodeContext}></div>`;
     if (value === undefined) {value = [];}
     if (this.collapseState === CollapseState.Expanded) {
@@ -521,10 +535,12 @@ export class SignalGroup extends SignalItem implements RowItem {
     this.vscodeContext = `${JSON.stringify({
       webviewSection: "signal-group",
       groupId: this.groupId,
-      preventDefaultContextMenuItems: true,
       rowId: this.rowId,
+      preventDefaultContextMenuItems: true,
     }).replace(/\s/g, '%x20')}`;
   }
+
+  getLabelText(): string {return this.label;}
 
   public getFlattenedRowIdList(ignoreCollapsed: boolean, ignoreRowId: number): number[] {
     let result: number[] = [this.rowId];

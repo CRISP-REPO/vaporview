@@ -1,5 +1,15 @@
 # Change Log
 
+## 1.4.2 - Upcoming Release
+
+- Added
+  - Multi signal select
+  - Multi signal reorder
+- Fixed
+  - Drag and drop from tree view places signals at the end of group
+  - Files with one time table entry now show values
+  - New groups now appear where right click event happened
+
 ## 1.4.1 - 9/12/2025 - Latest Release
 
 - Added

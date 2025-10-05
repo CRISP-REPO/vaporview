@@ -158,11 +158,14 @@ export class ControlBar {
     if (viewerState.markerTime === null) {return;}
 
     let nearestTime: number = viewport.timeStop;
+    if (direction === -1) {nearestTime = 0;}
     viewerState.selectedSignal.forEach((rowId) => {
+      if (viewerState.markerTime === null) {return;}
       const data  = dataManager.rowItems[rowId];
-      const time  = data.getNextEdge(nearestTime, direction, edge);
+      const time  = data.getNextEdge(viewerState.markerTime, direction, edge);
       if (time === null) {return;}
-      nearestTime = Math.min(nearestTime, time);
+      if (direction === 1)       {nearestTime = Math.min(nearestTime, time);}
+      else if (direction === -1) {nearestTime = Math.max(nearestTime, time);}
     });
 
     this.events.dispatch(ActionType.MarkerSet, nearestTime, 0);
@@ -276,14 +279,14 @@ export class ControlBar {
       const rowId  = viewerState.selectedSignal[0];
       if (dataManager.rowItems[rowId] instanceof VariableItem) {
         const format = dataManager.rowItems[rowId].valueFormat;
-        const checkValid = format.checkValid;
+        const checkValidSearch = format.checkValidSearch;
         const parseValue = format.parseValueForSearch;
 
         // check to see that the input is valid
         if (this.searchState === SearchState.Time) {
           inputValid = this.checkValidTimeString(inputText);
         } else if (this.searchState === SearchState.Value) {
-          inputValid = checkValid(inputText);
+          inputValid = checkValidSearch(inputText);
           if (inputValid) {this.parsedSearchValue = parseValue(inputText);}
           //console.log(inputValid);
           //console.log(this.parsedSearchValue);
