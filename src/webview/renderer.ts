@@ -76,10 +76,10 @@ export const multiBitWaveformRenderer: WaveformRenderer = {
     const adjustedTime  = time - viewportSpecs.timeScrollLeft;
   const points          = [[adjustedTime, 0]];
     const endPoints     = [[adjustedTime, 0]];
-  const xzPoints: any   = [];
+  const xzPoints: any[] = [];
     //const xzValues: string[]        = [];
   const textElements: any[]    = [];
-    let spansChunk      = true;
+  const spansChunk      = true;
     let moveCursor      = false;
     let drawBackgroundStrokes = false;
     const minTextWidth  = 12 * viewportSpecs.pixelTime;
@@ -127,12 +127,12 @@ export const multiBitWaveformRenderer: WaveformRenderer = {
         // We group the empty text elements that are too small to render together to
         // reduce the number of DOM operations
         if (elementWidth > minTextWidth) {
-          if (netlistData.formatValid) {
+          if (netlistData.formatCached) {
             parsedValue = netlistData.formattedValues[i - 1];
           } else {
             parsedValue = parseValue(value, signalWidth, !is4State);
           }
-          spansChunk = spansChunk || (transitionData[i][0] > viewportSpecs.timeScrollRight);
+          //spansChunk = spansChunk || (transitionData[i][0] > viewportSpecs.timeScrollRight);
           textElements.push(busValue(time, elementWidth, parsedValue, viewportSpecs, justifydirection, spansChunk));
         }
 
@@ -146,7 +146,7 @@ export const multiBitWaveformRenderer: WaveformRenderer = {
 
       time         = transitionData[i][0];
       value        = transitionData[i][1];
-      spansChunk   = false;
+      //spansChunk   = false;
     }
 
     elementWidth = postState[0] - time;
@@ -175,7 +175,7 @@ export const multiBitWaveformRenderer: WaveformRenderer = {
     }
 
     if (elementWidth > minTextWidth) {
-      if (netlistData.formatValid) {
+      if (netlistData.formatCached) {
         parsedValue = netlistData.formattedValues[endIndex - 1];
       } else {
         parsedValue = parseValue(value, signalWidth, !is4State);
@@ -208,15 +208,38 @@ export const multiBitWaveformRenderer: WaveformRenderer = {
     // Draw diamonds
     ctx.restore();
     ctx.save();
-    //ctx.translate(0.5 - viewportSpecs.pseudoScrollLeft, halfCanvasHeight);
     ctx.translate(0.5, halfCanvasHeight);
     ctx.globalAlpha = 1;
-    ctx.fillStyle = drawColor;
     ctx.transform(viewportSpecs.zoomRatio, 0, 0, viewportSpecs.zoomRatio, 0, 0);
     ctx.beginPath();
     points.forEach(([x, y]) => {ctx.lineTo(x, y);});
     endPoints.reverse().forEach(([x, y]) => {ctx.lineTo(x, y);});
-    ctx.fill();
+
+    const fillShape = true;
+
+    if (fillShape) {
+      ctx.fillStyle = drawColor;
+      ctx.fill();
+    } else {
+      ctx.fillStyle = viewportSpecs.backgroundColor;
+      ctx.fill();
+      ctx.restore();
+      ctx.strokeStyle = drawColor;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.save();
+      ctx.clip();
+      ctx.beginPath();
+      ctx.moveTo(0, 0.5);
+      ctx.lineTo(viewportSpecs.viewerWidth, 0.5);
+      ctx.moveTo(0, canvasHeight - 0.5);
+      ctx.lineTo(viewportSpecs.viewerWidth, canvasHeight - 0.5);
+      ctx.stroke();
+      ctx.restore();
+      ctx.save();
+      ctx.translate(0.5, halfCanvasHeight);
+      ctx.transform(viewportSpecs.zoomRatio, 0, 0, viewportSpecs.zoomRatio, 0, 0);
+    }
 
     //const gradient = ctx.createLinearGradient(0, 2 * minYPosition, 0, -2 * minYPosition);
     //gradient.addColorStop(0, "rgba(0, 0, 0, 0)");
@@ -232,25 +255,45 @@ export const multiBitWaveformRenderer: WaveformRenderer = {
     //});
     //ctx.fill();
 
-    // Draw non-2-state values
-    ctx.fillStyle = xzColor;
+  // Draw non-2-state values
+  ctx.beginPath();
   xzPoints.forEach((set: [number, number][]) => {
-      ctx.beginPath();
       ctx.moveTo(set[0][0], set[0][1]);
       ctx.lineTo(set[1][0], set[1][1]);
       ctx.lineTo(set[2][0], set[2][1]);
       ctx.lineTo(set[3][0], set[3][1]);
-      ctx.closePath();
-      ctx.fill();
+      ctx.lineTo(set[0][0], set[0][1]);
     });
-    ctx.restore();
+
+    if (fillShape) {
+      ctx.fillStyle = xzColor;
+      ctx.fill();
+      ctx.restore();
+    } else {
+      ctx.fillStyle = viewportSpecs.backgroundColor;
+      ctx.fill();
+      ctx.restore();
+      ctx.strokeStyle = xzColor;
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      ctx.save();
+      ctx.clip();
+      ctx.beginPath();
+      ctx.moveTo(0, 0.5);
+      ctx.lineTo(viewportSpecs.viewerWidth, 0.5);
+      ctx.moveTo(0, canvasHeight - 0.5);
+      ctx.lineTo(viewportSpecs.viewerWidth, canvasHeight - 0.5);
+      ctx.stroke();
+      ctx.restore();
+      ctx.save();
+    }
 
     // Draw Text
     const textY = halfCanvasHeight + 1;
     ctx.save();
     ctx.translate(0.5, 0);
     ctx.font = 'bold ' + viewportSpecs.fontStyle;
-    ctx.fillStyle = viewportSpecs.backgroundColor;
+    ctx.fillStyle = fillShape ? viewportSpecs.backgroundColor : viewportSpecs.textColor;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.imageSmoothingEnabled = false;
@@ -306,9 +349,9 @@ export const binaryWaveformRenderer: WaveformRenderer = {
     let initialValue       = initialState[1];
     let initialValue2state = parseInt(initialValue);
     let initialTime        = initialState[0];
-    let initialTimeOrStart = Math.max(initialState[0], -10);
-    const minDrawWidth  = viewportSpecs.pixelTime / viewportSpecs.pixelRatio;
-  const xzPath:any         = [];
+  let initialTimeOrStart = Math.max(initialState[0], -10);
+  const minDrawWidth     = viewportSpecs.pixelTime / viewportSpecs.pixelRatio;
+  const xzPath: any[]      = [];
     const drawColor        = netlistData.color;
     const xzColor          = viewportSpecs.xzColor;
     const viewerWidthTime  = viewportSpecs.viewerWidthTime;
@@ -330,7 +373,7 @@ export const binaryWaveformRenderer: WaveformRenderer = {
     let lastDrawTime   = 0;
     let lastNoDrawTime: any = null;
     let noDrawFlag     = false;
-  const noDrawPath: any     = [];
+  const noDrawPath: any[]     = [];
     let lastDrawValue  = initialValue2state;
     let lastnoDrawValue: any = null;
 
@@ -493,7 +536,7 @@ function createSvgWaveform(valueChangeChunk: any, netlistData: VariableItem, vie
   const minDrawWidth  = viewportSpecs.pixelTime / (viewportSpecs.pixelRatio * 4);
   const timeScrollLeft   = viewportSpecs.timeScrollLeft;
   const timeScrollRight  = viewportSpecs.timeScrollRight - timeScrollLeft;
-  const xzPath: any        = [];
+  const xzPath: any[]      = [];
   const valueIs9State    = netlistData.valueFormat.is9State;
 
   const rowHeight      = netlistData.rowHeight * WAVE_HEIGHT;
@@ -505,7 +548,7 @@ function createSvgWaveform(valueChangeChunk: any, netlistData: VariableItem, vie
     initialValue2state = "0";
   }
 
-  const accumulatedPath: any = [[-10 * viewportSpecs.pixelTime, 0]];
+  const accumulatedPath: any[] = [[-10 * viewportSpecs.pixelTime, 0]];
   accumulatedPath.push([initialTime - timeScrollLeft, evalCoordinates(initialValue2state)]);
 
   let value2state    = "0";
@@ -513,7 +556,7 @@ function createSvgWaveform(valueChangeChunk: any, netlistData: VariableItem, vie
   let lastDrawTime   = 0;
   let lastNoDrawTime: any = null;
   let noDrawFlag     = false;
-  const noDrawPath: any     = [];
+  const noDrawPath: any[]     = [];
   let lastDrawValue  = initialValue2state;
   let lastnoDrawValue: any = null;
 

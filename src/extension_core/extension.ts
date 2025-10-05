@@ -116,7 +116,7 @@ export async function activate(context: vscode.ExtensionContext) {
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.addVariable', async (e) => {
-    viewerProvider.filterAddSignalsInNetlist([e], true)
+    viewerProvider.filterAddSignalsInNetlist([e], true);
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.removeSignal', (e) => {
@@ -127,6 +127,10 @@ export async function activate(context: vscode.ExtensionContext) {
   
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.deleteSelectedSignals', (e) => {
     viewerProvider.deleteSelectedSignals();
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('vaporview.newSignalGroup', (e) => {
+    viewerProvider.newSignalGroup(e.name, e.groupPath, e.parentGroupId, e.rowId);
   }));
   
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.selectAllSignals', (e) => {
