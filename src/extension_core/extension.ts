@@ -321,7 +321,7 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!instancePath && e?.scopePath && e?.signalName) {
         instancePath = e.scopePath ? `${e.scopePath}.${e.signalName}` : e.signalName;
       }
-  if (!instancePath || instancePath.trim() === '') { return; }
+  if (!instancePath || instancePath.trim() === '') { console.log('DEBUG_MOUSEDC openSource abort: empty instancePath'); return; }
 
         // Normalize the key we use for caching (collapse repeated dots and trim edges)
         const normalizedKey = instancePath.replace(/\.+/g, '.').replace(/^\.+|\.+$/g, '');
@@ -331,6 +331,7 @@ export async function activate(context: vscode.ExtensionContext) {
           cached: lastOpenCache?.instancePath,
           hit: !!lastOpenCache && lastOpenCache.instancePath === normalizedKey,
         });
+        console.log('DEBUG_MOUSEDC normalized instancePath=', normalizedKey);
 
         // Fast-path: cache hit by normalized instancePath
         if (lastOpenCache && lastOpenCache.instancePath === normalizedKey) {
@@ -338,6 +339,7 @@ export async function activate(context: vscode.ExtensionContext) {
             uri: lastOpenCache.uri.toString(),
             range: `${lastOpenCache.range.start.line}:${lastOpenCache.range.start.character}-${lastOpenCache.range.end.line}:${lastOpenCache.range.end.character}`,
           });
+          console.log('DEBUG_MOUSEDC cache-hit reuse file=', lastOpenCache.uri.toString());
           progress.report({ message: 'Reusing last result…', increment: 20 });
           const { uri, range } = lastOpenCache;
           const doc = await vscode.workspace.openTextDocument(uri);
@@ -388,6 +390,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // Reuse the same normalization for downstream logic
   const normalized = normalizedKey;
   console.log('DEBUG DCREUSE normalized used for resolution', { normalized });
+  console.log('DEBUG_MOUSEDC scope/leaf parse start', { normalized });
       const parts = normalized.split('.').filter(Boolean);
       const leaf = parts.pop() || normalized; // signal name
       const scopePath = parts.join('.');      // hierarchical instance path without leaf
@@ -398,13 +401,15 @@ export async function activate(context: vscode.ExtensionContext) {
         prevParts.pop(); // drop previous leaf
         const prevScope = prevParts.join('.');
         const sameScope = prevScope === scopePath;
-        console.log('DEBUG DCREUSE scope-doc-reuse check', { prevScope, scopePath, sameScope });
+  console.log('DEBUG DCREUSE scope-doc-reuse check', { prevScope, scopePath, sameScope });
+  console.log('DEBUG_MOUSEDC same-scope check', { prevScope, scopePath, sameScope });
         if (sameScope) {
           progress.report({ message: `Reusing module for scope…`, increment: 12 });
           try {
             const reuseUri = lastOpenCache.uri;
             const reuseLoc = await findFirstTextMatchInFile(leaf, reuseUri);
             console.log('DEBUG DCREUSE scope-doc-reuse result', { leaf, found: !!reuseLoc, uri: reuseUri.toString() });
+            console.log('DEBUG_MOUSEDC scope-reuse search leaf result', { leaf, found: !!reuseLoc, uri: reuseUri.toString() });
             if (reuseLoc) {
               const { uri, range } = reuseLoc;
               const doc = await vscode.workspace.openTextDocument(uri);
@@ -452,6 +457,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }
           } catch (reuseErr) {
             console.warn('DEBUG DCREUSE scope-doc-reuse failed, falling back to resolution', reuseErr);
+            console.log('DEBUG_MOUSEDC scope-reuse failure, fallback');
           }
         }
       }
@@ -483,13 +489,15 @@ export async function activate(context: vscode.ExtensionContext) {
       // If scope matches the last resolved scope, reuse its module file to avoid heavy resolution
       if (lastScopeCache && scopePath && lastScopeCache.scopePath === scopePath) {
         moduleUri = lastScopeCache.moduleUri;
-        console.log('DEBUG DCREUSE scope-hit', { scopePath, moduleUri: moduleUri.toString() });
+  console.log('DEBUG DCREUSE scope-hit', { scopePath, moduleUri: moduleUri.toString() });
+  console.log('DEBUG_MOUSEDC scope-cache hit', { scopePath, moduleUri: moduleUri.toString() });
       }
 
       // Try resolve using most specific instance first (only if not reused from cache)
       for (let i = parts.length - 1; i >= 0 && !moduleUri; i--) {
         const inst = parts[i];
-        progress.report({ message: `Resolving instance '${inst}'…`, increment: 10 });
+  progress.report({ message: `Resolving instance '${inst}'…`, increment: 10 });
+  console.log('DEBUG_MOUSEDC resolving instance', inst);
         moduleUri = await tryResolveModuleForInstance(inst);
       }
 
@@ -498,6 +506,7 @@ export async function activate(context: vscode.ExtensionContext) {
         for (let i = parts.length - 1; i >= 0 && !moduleUri; i--) {
           const assumedModuleName = parts[i];
           progress.report({ message: `Searching module '${assumedModuleName}'…`, increment: 10 });
+          console.log('DEBUG_MOUSEDC trying module name heuristic', assumedModuleName);
           const decl = await findModuleDeclaration(assumedModuleName, includeGlobs);
           if (decl) moduleUri = decl.uri;
         }
@@ -507,10 +516,12 @@ export async function activate(context: vscode.ExtensionContext) {
       if (moduleUri) {
         if (scopePath) {
           lastScopeCache = { scopePath, moduleUri };
-          console.log('DEBUG DCREUSE scope-update', { scopePath, moduleUri: moduleUri.toString() });
+    console.log('DEBUG DCREUSE scope-update', { scopePath, moduleUri: moduleUri.toString() });
+    console.log('DEBUG_MOUSEDC scope-cache update', { scopePath, moduleUri: moduleUri.toString() });
         }
         progress.report({ message: `Searching '${leaf}' in module…`, increment: 15 });
-        const leafLoc = await findFirstTextMatchInFile(leaf, moduleUri);
+  const leafLoc = await findFirstTextMatchInFile(leaf, moduleUri);
+  console.log('DEBUG_MOUSEDC search leaf in module', { leaf, moduleUri: moduleUri.toString(), found: !!leafLoc });
         if (leafLoc) {
           resolved = leafLoc;
         } else {
@@ -523,7 +534,8 @@ export async function activate(context: vscode.ExtensionContext) {
       if (!resolved) {
         progress.report({ message: `Searching workspace for '${leaf}'…`, increment: 20 });
         // Global fallback: search HDL-like files for the leaf symbol
-        const locations = await findFirstTextMatchSimple(leaf, includeGlobs);
+  const locations = await findFirstTextMatchSimple(leaf, includeGlobs);
+  console.log('DEBUG_MOUSEDC workspace search leaf', { leaf, found: !!locations });
         if (locations) {
           resolved = locations;
         }
@@ -531,11 +543,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
       if (!resolved) {
         vscode.window.showInformationMessage(`Could not find source for ${leaf}`);
+        console.log('DEBUG_MOUSEDC openSource not found', { leaf });
         return;
       }
 
   const { uri, range } = resolved;
-      console.log('DEBUG MOUSEDC openSource found uri=', uri.toString(), 'range=', range);
+  console.log('DEBUG MOUSEDC openSource found uri=', uri.toString(), 'range=', range);
+  console.log('DEBUG_MOUSEDC openSource open uri=', uri.toString(), 'range=', `${range.start.line}:${range.start.character}-${range.end.line}:${range.end.character}`);
       progress.report({ message: 'Opening document…', increment: 25 });
       const doc = await vscode.workspace.openTextDocument(uri);
 
@@ -546,6 +560,7 @@ export async function activate(context: vscode.ExtensionContext) {
     uri: uri.toString(),
     range: `${range.start.line}:${range.start.character}-${range.end.line}:${range.end.character}`,
   });
+  console.log('DEBUG_MOUSEDC cache update', { key: normalizedKey, uri: uri.toString() });
 
   // Determine active group (likely the waveform viewer). We want the source in a split group.
   const activeGroup = vscode.window.tabGroups?.activeTabGroup;

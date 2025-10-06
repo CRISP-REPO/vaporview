@@ -341,6 +341,12 @@ export function outputLog(message: string) {
 }
 
 class VaporviewWebview {
+  // Fallback double-click state for waveform area
+  private lastWaveformClickTime: number = 0;
+  private lastWaveformClickRowId: number | null = null;
+  private focusFallbackInstalled: boolean = false;
+  private dblClickGuardRowId: RowId | null = null;
+  private dblClickGuardExpiresAt: number = 0;
 
   // HTML Elements
   webview: HTMLElement;
@@ -477,6 +483,18 @@ class VaporviewWebview {
     this.events.subscribe(ActionType.MarkerSet, this.handleMarkerSet);
     this.events.subscribe(ActionType.SignalSelect, this.handleSignalSelect);
     this.events.subscribe(ActionType.ReorderSignals, this.reorderSignals);
+
+    // Install a single capture-phase click listener to keep focus on the webview when clicking labels/values
+    if (!this.focusFallbackInstalled) {
+      window.addEventListener('click', (e) => {
+        const el = e.target as HTMLElement | null;
+        if (!el) {return;}
+        if (el.closest('#waveform-labels') || el.closest('#value-display')) {
+          try { this.webview.focus(); console.log('DEBUG WFSELECT focusFallbackCaptureClick'); } catch(_) { /* empty */ }
+        }
+      }, { capture: true });
+      this.focusFallbackInstalled = true;
+    }
   }
 
   // Function to test whether or not the user is using a touchpad
@@ -546,14 +564,6 @@ class VaporviewWebview {
       //  this.viewport.handleScrollEvent(this.viewport.pseudoScrollLeft + e.deltaX);
       //  this.scrollArea.scrollTop       += e.deltaY;
       //  this.labelsScroll.scrollTop      = this.scrollArea.scrollTop;
-        // Capture-phase click focus fallback for labels/value areas
-        window.addEventListener('click', (e) => {
-          const el = e.target as HTMLElement | null;
-          if (!el) {return;}
-          if (el.closest('#waveform-labels') || el.closest('#value-display')) {
-            try { this.webview.focus(); console.log('DEBUG WFSELECT focusFallbackCaptureClick'); } catch(_) { /* empty */ }
-          }
-        }, { capture: true });
       //  this.valuesScroll.scrollTop  = this.scrollArea.scrollTop;
       //} else {
       //  this.viewport.handleScrollEvent(this.viewport.pseudoScrollLeft + deltaY);
@@ -918,6 +928,35 @@ class VaporviewWebview {
     const rowId = parseInt(id.split('-')[1]);
     if (isNaN(rowId)) {return;}
 
+    // Fallback double-click detection: treat as double-click if two left clicks within 1000ms on the same row
+    if (!event.shiftKey && event.button === 0) {
+      const now = Date.now();
+      const delta = now - this.lastWaveformClickTime;
+      console.log('DEBUG_MOUSEDC waveform click timing', { rowId, lastRow: this.lastWaveformClickRowId, delta });
+      if (this.lastWaveformClickRowId === rowId && delta <= 600) {
+        try {
+          const item = dataManager.rowItems[rowId];
+          if (item instanceof VariableItem) {
+            let instancePath = item.signalName;
+            if (item.scopePath && item.scopePath !== '') {instancePath = item.scopePath + '.' + item.signalName;}
+            console.log('DEBUG_MOUSEDC dblclick fallback waveform rowId=', rowId, 'instancePath=', instancePath);
+            vscode.postMessage({
+              command: 'executeCommand',
+              commandName: 'vaporview.openSource',
+              args: { instancePath, uri: viewerState.uri }
+            });
+          }
+        } catch (_) { /* ignore */ }
+        this.lastWaveformClickRowId = null;
+        this.lastWaveformClickTime  = 0;
+        this.clearDblClickGuard();
+        return;
+      }
+      this.lastWaveformClickRowId = rowId;
+      this.lastWaveformClickTime  = now;
+      this.setDblClickGuard(rowId);
+    }
+
     if (event.shiftKey) {
       const anchor = viewerState.selectionAnchor ?? viewerState.lastSelectedSignal ?? rowId;
       const flat   = viewerState.visibleSignalsFlat;
@@ -941,6 +980,16 @@ class VaporviewWebview {
   }
     // Force focus so subsequent Delete/Backspace is received
     try { this.webview.focus(); } catch (_) { /* ignore */ }
+  }
+
+  private setDblClickGuard(rowId: RowId) {
+    this.dblClickGuardRowId = rowId;
+    this.dblClickGuardExpiresAt = Date.now() + 600;
+  }
+
+  private clearDblClickGuard() {
+    this.dblClickGuardRowId = null;
+    this.dblClickGuardExpiresAt = 0;
   }
 
   // #region Global Events

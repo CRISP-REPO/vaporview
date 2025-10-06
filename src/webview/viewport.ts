@@ -142,7 +142,15 @@ export class Viewport {
     // click handler to handle clicking inside the waveform viewer
     // gets the absolute x position of the click relative to the scrollable content
   contentArea.addEventListener('mousedown',        (e) => {this.handleScrollAreaMouseDown(e);});
-  contentArea.addEventListener('dblclick',         (e) => {this.handleOpenSourceFromWaveform(e);});
+    contentArea.addEventListener('dblclick',         (e) => {this.handleOpenSourceFromWaveform(e);});
+    // Capture-phase dblclick debug
+    contentArea.addEventListener('dblclick',         (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      console.log('DEBUG_MOUSEDC capture dblclick waveform', { target: t?.className });
+    }, true);
+  // Right-click (context menu) debug logging for waveform and ruler areas
+  contentArea.addEventListener('contextmenu',      (e) => {this.handleContextMenuWaveform(e);});
+  rulerElement.addEventListener('contextmenu',     (e) => {this.handleContextMenuRuler(e);});
     scrollbar.addEventListener('mousedown',          (e) => {this.handleScrollbarDrag(e);});
     scrollbarContainer.addEventListener('mousedown', (e) => {this.handleScrollbarContainerClick(e);});
 
@@ -168,12 +176,47 @@ export class Viewport {
     this.events.subscribe(ActionType.RedrawVariable, this.handleRedrawSignal);
     this.events.subscribe(ActionType.Resize, this.updateViewportWidth);
     this.events.subscribe(ActionType.UpdateColorTheme, this.handleColorChange);
+
+    // Global dblclick logger as a last resort
+    document.addEventListener('dblclick', (e: MouseEvent) => {
+      const t = e.target as HTMLElement;
+      console.log('DEBUG_MOUSEDC document dblclick', { target: t?.className });
+    }, { capture: true });
+  }
+  private handleContextMenuWaveform(event: MouseEvent) {
+    const target = event.target as HTMLElement;
+    const waveform = target?.closest('.waveform-container') as HTMLElement | null;
+    const idStr = waveform?.id?.split('-').slice(1).join('-');
+    const rowId = idStr ? parseInt(idStr, 10) : null;
+    const ctxEl = (target?.closest('[data-vscode-context]') as HTMLElement | null) || waveform || this.contentArea;
+    const ctxRaw = ctxEl?.getAttribute('data-vscode-context');
+    console.log('DEBUG_RMB waveform contextmenu', {
+      button: event.button,
+      target: target?.className,
+      rowId,
+      dataContext: ctxRaw
+    });
+    // Don't prevent default; allow VS Code to show its context menu
+  }
+
+  private handleContextMenuRuler(event: MouseEvent) {
+    const target = event.target as HTMLElement;
+    const ctxEl = (target?.closest('[data-vscode-context]') as HTMLElement | null) || this.rulerElement;
+    const ctxRaw = ctxEl?.getAttribute('data-vscode-context');
+    console.log('DEBUG_RMB ruler contextmenu', {
+      button: event.button,
+      target: target?.className,
+      dataContext: ctxRaw
+    });
+    // Don't prevent default; allow VS Code to show its context menu
   }
 
   init(metadata: any, uri: string) {
     document.title     = metadata.filename;
+    // Preserve the viewer-level context so VS Code shows webview context menus (e.g., time unit submenu)
     document.body.setAttribute("data-vscode-context", JSON.stringify({
       preventDefaultContextMenuItems: true,
+      webviewSection: 'viewer',
       webviewSelection: true,
       uri: uri,
     }));
@@ -388,6 +431,7 @@ export class Viewport {
     let instancePath = item.signalName;
     if (item.scopePath && item.scopePath !== '') {instancePath = item.scopePath + '.' + item.signalName;}
     console.log('DEBUG MOUSEDC waveform dblclick rowId=', rowId, 'instancePath=', instancePath, 'uri=', viewerState.uri);
+    console.log('DEBUG_MOUSEDC dblclick waveform rowId=', rowId, 'instancePath=', instancePath);
     vscode.postMessage({
       command: 'executeCommand',
       commandName: 'vaporview.openSource',
@@ -665,6 +709,8 @@ export class Viewport {
   }
 
   handleSignalSelect(rowIdList: RowId[], lastSelected: RowId | null) {
+    // Avoid flashing selection styles during a dblclick window; the labels side suppresses re-render.
+    // Here we keep behavior minimal and avoid heavy DOM changes; selection classes apply but we rely on labels guard.
     // Clear previous selection classes
     const all = viewerState.displayedSignalsFlat;
     all.forEach((rid) => {

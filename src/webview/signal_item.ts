@@ -116,7 +116,7 @@ export class VariableItem extends SignalItem implements RowItem {
     const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
     const tooltip       = "Name: " + fullPath + "\nType: " + this.variableType + "\nWidth: " + this.signalWidth + "\nEncoding: " + this.encoding;
     return `<div class="waveform-label is-idle" id="label-${rowId}" title="${tooltip}" data-vscode-context=${this.vscodeContext}>
-              <div class='waveform-row ${selectorClass} ${height}'>
+              <div class='waveform-row ${selectorClass} ${height}' data-vscode-context=${this.vscodeContext}>
                 <p style="opacity:50%">${scopePath}</p><p>${signalName}</p>
               </div>
             </div>`;
@@ -148,6 +148,8 @@ export class VariableItem extends SignalItem implements RowItem {
     const canvas = document.createElement('canvas');
     canvas.setAttribute('id', 'waveform-canvas-' + rowId);
     canvas.classList.add('waveform-canvas');
+  // Attach the VS Code webview context to the canvas so right-click works directly on the waveform
+  canvas.setAttribute('data-vscode-context', this.vscodeContext);
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d');
     const canvasHeight = (this.rowHeight * WAVE_HEIGHT) - 8;
@@ -501,7 +503,7 @@ export class SignalGroup extends SignalItem implements RowItem {
     const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
     //const tooltip       = "Name: " + fullPath + "\nType: " + this.variableType + "\nWidth: " + this.signalWidth + "\nEncoding: " + this.encoding;
     return `<div class="waveform-label waveform-group is-idle ${groupClass}" id="label-${this.rowId}" data-vscode-context=${this.vscodeContext}>
-              <div class="waveform-row ${selectorClass} height1x">${this.createWaveformRowContent()}</div>
+              <div class="waveform-row ${selectorClass} height1x" data-vscode-context=${this.vscodeContext}>${this.createWaveformRowContent()}</div>
               <div class="labels-group child-group">${childElements}</div>
             </div>`;
     }
