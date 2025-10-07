@@ -39,22 +39,11 @@ export class LabelsPanels {
   dragFreezeTimeout: any     = null;
   renameActive: boolean      = false;
   valueAtMarker: any         = {};
-
-  // Double-click workaround state (two single clicks within 1s)
-  private lastLabelClickTime: number = 0;
-  private lastLabelClickRowId: RowId | null = null;
-  private lastValueClickTime: number = 0;
-  private lastValueClickRowId: RowId | null = null;
-  // Guard to avoid re-rendering between two clicks so dblclick can be detected
-  private dblClickGuardRowId: RowId | null = null;
-  private dblClickGuardExpiresAt: number = 0;
-  private dblClickGuardTimer: any = null;
-  // Debounce to prevent duplicate opens when both click(detail>=2) and dblclick fire
-  private lastOpenSourceAt: number = 0;
+  
 
   constructor(events: EventHandler) {
     this.events = events;
-  try { console.log('DEBUG WFSELECT labelsVersion', { version: 'v3', timestamp: Date.now() }); } catch(_){ /* noop */ }
+  try { console.log('DEBUG WFSELECT labelsVersion', { version: 'v5', timestamp: Date.now() }); } catch(_){ /* noop */ }
 
     const webview      = document.getElementById('vaporview-top');
     const labels       = document.getElementById('waveform-labels');
@@ -96,18 +85,7 @@ export class LabelsPanels {
   valueDisplay.addEventListener('click', (e) => this.clickValueDisplay(e));
   console.log('DEBUG WFSELECT labels listeners attached');
 
-  // Double-click handlers to open source for a signal
-  labels.addEventListener('dblclick', (e) => this.handleOpenSourceFromLabels(e));
-  valueDisplay.addEventListener('dblclick', (e) => this.handleOpenSourceFromValues(e));
-  // Capture-phase dblclick debug to ensure we see the event even if bubbling is stopped elsewhere
-  labels.addEventListener('dblclick', (e: MouseEvent) => {
-    const t = e.target as HTMLElement;
-    console.log('DEBUG_MOUSEDC capture dblclick labels', { target: t?.className });
-  }, true);
-  valueDisplay.addEventListener('dblclick', (e: MouseEvent) => {
-    const t = e.target as HTMLElement;
-    console.log('DEBUG_MOUSEDC capture dblclick values', { target: t?.className });
-  }, true);
+  // Dbl-click: handled exclusively via click detail>=2 (no separate dblclick listeners)
   // Right-click (context menu) debug logging
   labels.addEventListener('contextmenu', (e) => this.handleContextMenuLabels(e));
   valueDisplay.addEventListener('contextmenu', (e) => this.handleContextMenuValues(e));
@@ -144,10 +122,9 @@ export class LabelsPanels {
     const target = event.target as HTMLElement;
     const container = target?.closest('.value-display-item') as HTMLElement | null;
     let rowId: number | null = null;
-    if (container) {
-      const labelsList = Array.from(this.valueDisplay.querySelectorAll('.value-display-item'));
-      const itemIndex  = labelsList.indexOf(container);
-      if (itemIndex !== -1) { rowId = viewerState.displayedSignals[itemIndex]; }
+    if (container && container.id && container.id.startsWith('value-')) {
+      const parsed = parseInt(container.id.split('-')[1]);
+      rowId = isNaN(parsed) ? null : parsed;
     }
     const ctxEl = (target?.closest('[data-vscode-context]') as HTMLElement | null) || container;
     const ctxRaw = ctxEl?.getAttribute('data-vscode-context');
@@ -193,42 +170,41 @@ export class LabelsPanels {
   }
 
   clickValueDisplay(event: any) {
-    console.log('DEBUG WFSELECT enter clickValueDisplay', { shiftKey: !!event.shiftKey, target: (event.target && event.target.className) });
-    const labelsList   = Array.from(this.valueDisplay.querySelectorAll('.value-display-item'));
-    const clickedLabel = event.target.closest('.value-display-item');
-    const itemIndex    = labelsList.indexOf(clickedLabel);
-    if (itemIndex === -1) {return;}
-    const rowId = viewerState.displayedSignals[itemIndex];
+    console.log('DIAG SELECT values.click', {
+      shiftKey: !!event.shiftKey,
+      ctrlKey: !!event.ctrlKey,
+      metaKey: !!event.metaKey,
+      button: event?.button,
+      detail: event?.detail,
+      targetClass: (event.target && event.target.className),
+    });
+    const clickedLabel = event.target.closest('.value-display-item') as HTMLElement | null;
+    if (!clickedLabel) {return;}
+    let rowId: number | null = null;
+    if (clickedLabel.id && clickedLabel.id.startsWith('value-')) {
+      const parsed = parseInt(clickedLabel.id.split('-')[1]);
+      rowId = isNaN(parsed) ? null : parsed;
+    }
+    if (rowId === null) {return;}
     // Prefer native click count for reliable dblclick even if native dblclick event is lost
     if (!event.shiftKey && event.button === 0 && event.detail >= 2) {
-      try { console.log('DEBUG_MOUSEDC values click detail>=2 -> open', { rowId, detail: event.detail }); } catch(_) { /* noop */ }
-      this.clearDblClickGuard();
+  try { console.log('DEBUG_MOUSEDC values click detail>=2 -> open', { rowId, detail: event.detail }); } catch(_) { /* noop */ }
       this.openSourceForRowId(rowId);
       return;
-    }
-    // Fallback double-click detection: 2 clicks within 1000ms on same rowId
-    if (!event.shiftKey && event.button === 0) {
-      const now = Date.now();
-      const delta = now - this.lastValueClickTime;
-      console.log('DEBUG_MOUSEDC values click timing', { rowId, lastRow: this.lastValueClickRowId, delta });
-      if (this.lastValueClickRowId === rowId && delta <= 1000) {
-        console.log('DEBUG_MOUSEDC dblclick fallback values rowId=', rowId);
-        this.lastValueClickRowId = null;
-        this.lastValueClickTime  = 0;
-        this.clearDblClickGuard();
-        this.openSourceForRowId(rowId);
-        return;
-      }
-      this.lastValueClickRowId = rowId;
-      this.lastValueClickTime  = now;
-      this.setDblClickGuard(rowId);
     }
     // Use centralized selection helper to unify behavior across labels and waveform
     handleClickSelection(event, rowId);
   }
 
   clicklabel (event: any) {
-    console.log('DEBUG WFSELECT enter clicklabel', { shiftKey: !!event.shiftKey, button: event.button, target: (event.target && event.target.className) });
+    console.log('DIAG SELECT labels.click', {
+      shiftKey: !!event.shiftKey,
+      ctrlKey: !!event.ctrlKey,
+      metaKey: !!event.metaKey,
+      button: event.button,
+      detail: event?.detail,
+      targetClass: (event.target && event.target.className)
+    });
     if (this.dragInProgress) {return;}
     if (this.renameActive) {return;}
     const clickedLabel = event.target.closest('.waveform-label');
@@ -243,27 +219,9 @@ export class LabelsPanels {
     } else {
       // Prefer native click count for reliable dblclick even if native dblclick event is lost
       if (!event.shiftKey && event.button === 0 && event.detail >= 2) {
-        try { console.log('DEBUG_MOUSEDC labels click detail>=2 -> open', { rowId, detail: event.detail }); } catch(_) { /* noop */ }
-        this.clearDblClickGuard();
+  try { console.log('DEBUG_MOUSEDC labels click detail>=2 -> open', { rowId, detail: event.detail }); } catch(_) { /* noop */ }
         this.openSourceForRowId(rowId);
         return;
-      }
-      // Fallback double-click detection: 2 clicks within 1000ms on same rowId
-      if (!event.shiftKey && event.button === 0) {
-        const now = Date.now();
-        const delta = now - this.lastLabelClickTime;
-        console.log('DEBUG_MOUSEDC labels click timing', { rowId, lastRow: this.lastLabelClickRowId, delta });
-        if (this.lastLabelClickRowId === rowId && delta <= 1000) {
-          console.log('DEBUG_MOUSEDC dblclick fallback labels rowId=', rowId);
-          this.lastLabelClickRowId = null;
-          this.lastLabelClickTime  = 0;
-          this.clearDblClickGuard();
-          this.openSourceForRowId(rowId);
-          return;
-        }
-        this.lastLabelClickRowId = rowId;
-        this.lastLabelClickTime  = now;
-        this.setDblClickGuard(rowId);
       }
       // Use centralized selection helper
       handleClickSelection(event, rowId);
@@ -748,25 +706,27 @@ export class LabelsPanels {
     viewerState.selectedSignalIndex = (lastRowId !== null)
       ? viewerState.visibleSignalsFlat.findIndex((signal) => signal === lastRowId)
       : null;
-    console.log('DEBUG WFSELECT labels.handleSignalSelect', { lastRowId, selectedSignalIndex: viewerState.selectedSignalIndex, selectedSignals: viewerState.selectedSignals, selectionAnchor: viewerState.selectionAnchor });
+    console.log('DIAG SELECT labels.handleSignalSelect', {
+      lastRowId,
+      selectedSignalIndex: viewerState.selectedSignalIndex,
+      selectedSignals: viewerState.selectedSignals,
+      selectionAnchor: viewerState.selectionAnchor
+    });
 
   if (this.dragDivider) { this.dragDivider.style.display = 'none'; }
 
+    console.log('DIAG SELECT labels.clearingSelections', { displayedFlatLen: viewerState.displayedSignalsFlat.length });
     viewerState.displayedSignalsFlat.forEach((rowId) => {
       this.selectRowId(rowId, false);
     });
 
+    console.log('DIAG SELECT labels.applyingSelections', { count: rowIdList.length, rowIdList });
     rowIdList.forEach((rowId) => {
       this.selectRowId(rowId, true);
     });
     viewerState.lastSelectedSignal = lastRowId;
-    // If we're within the dblclick guard window for the focused row, skip re-render
-    const now = Date.now();
-    if (lastRowId !== null && this.dblClickGuardRowId === lastRowId && now < this.dblClickGuardExpiresAt) {
-      try { console.log('DEBUG_MOUSEDC suppress render for dblclick guard', { rowId: lastRowId, remaining: this.dblClickGuardExpiresAt - now }); } catch(_) { /* noop */ }
-    } else {
-      this.renderLabelsPanels();
-    }
+    // Always re-render on selection to keep labels/values in sync
+    this.renderLabelsPanels();
   }
 
   handleRedrawVariable(rowId: RowId) {
@@ -800,10 +760,6 @@ export class LabelsPanels {
   private openSourceForRowId(rowId: RowId) {
     const item = dataManager.rowItems[rowId];
     if (!(item instanceof VariableItem)) {return;}
-    // Debounce duplicate opens that can occur if both click(detail>=2) and dblclick handlers fire
-    const nowTs = Date.now();
-    if (nowTs - this.lastOpenSourceAt < 250) { return; }
-    this.lastOpenSourceAt = nowTs;
     let instancePath = item.signalName;
     if (item.scopePath && item.scopePath !== '') {instancePath = item.scopePath + '.' + item.signalName;}
     console.log('DEBUG MOUSEDC openSourceForRowId instancePath=', instancePath, 'uri=', viewerState.uri);
@@ -812,20 +768,5 @@ export class LabelsPanels {
       commandName: 'vaporview.openSource',
       args: { instancePath, uri: viewerState.uri }
     });
-  }
-
-  private setDblClickGuard(rowId: RowId) {
-    this.clearDblClickGuard();
-    this.dblClickGuardRowId = rowId;
-    // Guard re-render for 1000ms to ensure the second click lands on the same DOM node
-    this.dblClickGuardExpiresAt = Date.now() + 1000;
-    this.dblClickGuardTimer = setTimeout(() => this.clearDblClickGuard(), 1050);
-    try { console.log('DEBUG_MOUSEDC set dblclick guard', { rowId, until: this.dblClickGuardExpiresAt }); } catch(_) { /* noop */ }
-  }
-
-  private clearDblClickGuard() {
-    if (this.dblClickGuardTimer) { clearTimeout(this.dblClickGuardTimer); this.dblClickGuardTimer = null; }
-    this.dblClickGuardRowId = null;
-    this.dblClickGuardExpiresAt = 0;
   }
 }

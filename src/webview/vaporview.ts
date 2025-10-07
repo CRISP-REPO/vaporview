@@ -236,24 +236,59 @@ export function revealSignal(rowId: RowId) {
 }
 
 export function handleClickSelection(event: MouseEvent, rowId: RowId) {
+  try {
+    console.log('DIAG SELECT handleClickSelection: enter', {
+      rowId,
+      button: (event as any)?.button,
+      detail: (event as any)?.detail,
+      shiftKey: !!event.shiftKey,
+      ctrlKey: !!event.ctrlKey,
+      metaKey: !!event.metaKey,
+      prevSelectedSignals: [...(viewerState.selectedSignals || viewerState.selectedSignal || [])],
+      lastSelectedSignal: viewerState.lastSelectedSignal,
+      selectionAnchor: viewerState.selectionAnchor,
+      visibleSignalsFlatLen: viewerState.visibleSignalsFlat.length
+    });
+  } catch (_) { /* noop */ }
+  // Determine current selection baseline
+  const currentSelection = (viewerState.selectedSignals && viewerState.selectedSignals.length > 0)
+    ? viewerState.selectedSignals
+    : viewerState.selectedSignal;
+
   let newSelection: RowId[] = [rowId];
-  if (viewerState.selectedSignal.length === 0 || viewerState.lastSelectedSignal === null) {
-    // No existing selection, just select the clicked row
-  }
-  else if (event.shiftKey) {
+
+  // Shift extends from lastSelectedSignal if available
+  if (event.shiftKey && viewerState.lastSelectedSignal !== null) {
     const lastSelectedIndex = viewerState.visibleSignalsFlat.indexOf(viewerState.lastSelectedSignal);
     const clickedIndex      = viewerState.visibleSignalsFlat.indexOf(rowId);
     const startIndex        = Math.min(lastSelectedIndex, clickedIndex);
     const endIndex          = Math.max(lastSelectedIndex, clickedIndex);
-    const addedSignals      = viewerState.visibleSignalsFlat.slice(startIndex, endIndex + 1).filter(id => !viewerState.selectedSignal.includes(id));
-    newSelection            = viewerState.selectedSignal.concat(addedSignals);
-  } else if (event.ctrlKey || event.metaKey) {
-    if (viewerState.selectedSignal.includes(rowId)) {
-      newSelection = viewerState.selectedSignal.filter(id => id !== rowId);
+    const range             = viewerState.visibleSignalsFlat.slice(startIndex, endIndex + 1);
+    // Merge with existing multi-select without duplicates
+    const set = new Set<RowId>([...currentSelection, ...range]);
+    newSelection = Array.from(set.values());
+  }
+  // Ctrl/Cmd toggles membership
+  else if (event.ctrlKey || event.metaKey) {
+    if (currentSelection.includes(rowId)) {
+      newSelection = currentSelection.filter(id => id !== rowId);
     } else {
-      newSelection = viewerState.selectedSignal.concat([rowId]);
+      newSelection = currentSelection.concat([rowId]);
     }
   }
+  // Plain click: single-select and set anchor
+  else {
+    newSelection = [rowId];
+    viewerState.selectionAnchor = rowId;
+  }
+
+  try {
+    console.log('DIAG SELECT handleClickSelection: dispatch', {
+      rowId,
+      newSelection,
+      mode: event.shiftKey ? 'shift' : (event.ctrlKey || event.metaKey) ? 'toggle' : 'single'
+    });
+  } catch (_) { /* noop */ }
   events.dispatch(ActionType.SignalSelect, newSelection, rowId);
 }
 
@@ -475,6 +510,7 @@ class VaporviewWebview {
     this.webview.addEventListener('drop', (e) => {this.handleDrop(e);});
   // Allow selecting rows by clicking waveform area as well
   this.contentArea.addEventListener('click', (e) => {this.clickWaveform(e);});
+  this.contentArea.addEventListener('contextmenu', (e) => {this.handleContextMenuWaveform(e);});
 
     this.handleMarkerSet    = this.handleMarkerSet.bind(this);
     this.handleSignalSelect = this.handleSignalSelect.bind(this);
@@ -920,6 +956,18 @@ class VaporviewWebview {
 
   private clickWaveform(event: MouseEvent) {
     // Only handle clicks on waveform rows
+    try {
+      const t = event.target as HTMLElement;
+      console.log('DIAG SELECT waveform.click', {
+        targetClass: t?.className,
+        targetId: t?.id,
+        button: event.button,
+        detail: (event as any)?.detail,
+        shiftKey: !!event.shiftKey,
+        ctrlKey: !!event.ctrlKey,
+        metaKey: !!event.metaKey
+      });
+    } catch (_) { /* noop */ }
     const target = event.target as HTMLElement;
     const container = target.closest('.waveform-container') as HTMLElement | null;
     if (!container) {return;}
@@ -957,29 +1005,33 @@ class VaporviewWebview {
       this.setDblClickGuard(rowId);
     }
 
-    if (event.shiftKey) {
-      const anchor = viewerState.selectionAnchor ?? viewerState.lastSelectedSignal ?? rowId;
-      const flat   = viewerState.visibleSignalsFlat;
-      const aIdx   = Math.max(0, flat.indexOf(anchor));
-      const bIdx   = Math.max(0, flat.indexOf(rowId));
-      const [start, end] = aIdx <= bIdx ? [aIdx, bIdx] : [bIdx, aIdx];
-      viewerState.selectedSignals = flat.slice(start, end + 1);
-      viewerState.selectionAnchor = anchor;
-      console.log('DEBUG WFSELECT waveform shift-click', { anchor, rowId, aIdx, bIdx, start, end, selectedSignals: viewerState.selectedSignals });
-    } else {
-      viewerState.selectedSignals = [rowId];
-      viewerState.selectionAnchor = rowId;
-      console.log('DEBUG WFSELECT waveform click', { rowId, selectedSignals: viewerState.selectedSignals });
-    }
-
-  {
-    const list = (viewerState.selectedSignals && viewerState.selectedSignals.length > 0)
-      ? [...viewerState.selectedSignals]
-      : [rowId];
-    this.events.dispatch(ActionType.SignalSelect, list, rowId);
-  }
+    // Delegate to centralized selection logic to keep behavior consistent
+    handleClickSelection(event, rowId);
     // Force focus so subsequent Delete/Backspace is received
     try { this.webview.focus(); } catch (_) { /* ignore */ }
+  }
+
+  // Log right-click context menu details on waveform area
+  private handleContextMenuWaveform(event: MouseEvent) {
+    const target = event.target as HTMLElement;
+    const container = target?.closest('.waveform-container') as HTMLElement | null;
+    let rowId: number | null = null;
+    if (container && container.id.startsWith('waveform-')) {
+      const parsed = parseInt(container.id.split('-')[1]);
+      rowId = isNaN(parsed) ? null : parsed;
+    }
+    const ctxEl = (target?.closest('[data-vscode-context]') as HTMLElement | null) || container;
+    const ctxRaw = ctxEl?.getAttribute('data-vscode-context');
+    try {
+      console.log('DIAG RMB waveform contextmenu', {
+        button: event.button,
+        targetClass: target?.className,
+        targetId: target?.id,
+        rowId,
+        dataContext: ctxRaw
+      });
+    } catch (_) { /* noop */ }
+    // Do not prevent default to allow VS Code menu
   }
 
   private setDblClickGuard(rowId: RowId) {
@@ -1444,7 +1496,7 @@ export const viewport    = new Viewport(events);
 export const labelsPanel = new LabelsPanels(events);
 const vaporview          = new VaporviewWebview(events, viewport, controlBar);
 
-try { console.log('DEBUG WFSELECT vaporviewVersion', { version: 'v7', timestamp: Date.now() }); } catch(_) { /* empty */ }
+try { console.log('DEBUG WFSELECT vaporviewVersion', { version: 'v9', timestamp: Date.now() }); } catch(_) { /* empty */ }
 
 // Capture-phase Delete fallback to guarantee multi-delete fires
 window.addEventListener('keydown', (e) => {
