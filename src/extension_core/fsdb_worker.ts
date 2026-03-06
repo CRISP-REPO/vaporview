@@ -1,5 +1,16 @@
 import type { NetlistId, SignalId } from '../common/types';
 
+// Detect IPC mode (fork) vs stdio mode (SSH spawn)
+const hasIPC = typeof process.send === 'function';
+
+function sendMsg(msg: any): void {
+    if (hasIPC) {
+        process.send!(msg);
+    } else {
+        process.stdout.write(JSON.stringify(msg) + '\n');
+    }
+}
+
 let fsdbAddon: any = null;
 try {
     fsdbAddon = require('../build/Release/fsdb_reader.node');
@@ -9,22 +20,39 @@ try {
     // 2. Run the extension and find PID for fsdb_worker.js: `ps aux | grep fsdb_worker`
     // 3. Attach gdb to the worker process: `gdb -p <PID>`
 } catch (error) {
-    process.send!({ command: 'require-failed', error: error });
+    sendMsg({ command: 'require-failed', error: error });
 }
 
-console.log("Start FSDB worker");
+console.error("Start FSDB worker" + (hasIPC ? " (IPC)" : " (stdio)"));
 
-// Listen for messages from the main process.
-process.on('message', (message: any) => {
-    // try {
-    //     console.log("Worker received message: " + JSON.stringify(message, null, 2));
-    // } catch (e) {
-    //     console.error('Data is not serializable:', e);
-    // }
+function messageHandler(message: any) {
     const result = handleMessage(message);
+    sendMsg({ id: message.id, result: result });
+}
 
-    process.send!({ id: message.id, result: result });
-});
+// Listen for messages: IPC channel or stdin
+if (hasIPC) {
+    process.on('message', messageHandler);
+} else {
+    let buf = '';
+    process.stdin.setEncoding('utf-8');
+    process.stdin.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+            const line = buf.slice(0, nl);
+            buf = buf.slice(nl + 1);
+            if (line.trim()) {
+                try {
+                    messageHandler(JSON.parse(line));
+                } catch (e: any) {
+                    console.error('FSDB worker: failed to parse stdin message:', e.message);
+                }
+            }
+        }
+    });
+    process.stdin.resume();
+}
 
 function handleMessage(message: any) {
     switch (message.command) {
@@ -44,7 +72,7 @@ function handleMessage(message: any) {
 }
 
 function fsdbScopeCallback(name: string, type: string, path: string, netlistId: number, scopeOffsetIdx: number) {
-    process.send!({
+    sendMsg({
         command: 'fsdb-scope-callback',
         name: name,
         type: type,
@@ -55,13 +83,13 @@ function fsdbScopeCallback(name: string, type: string, path: string, netlistId: 
 }
 
 function fsdbUpscopeCallback() {
-    process.send!({
+    sendMsg({
         command: 'fsdb-upscope-callback'
     });
 }
 
 function setMetadata(scopecount: number, varcount: number, timescale: number, timeunit: string) {
-    process.send!({
+    sendMsg({
         command: 'setMetadata',
         scopecount: scopecount,
         varcount: varcount,
@@ -71,7 +99,7 @@ function setMetadata(scopecount: number, varcount: number, timescale: number, ti
 }
 
 function setChunkSize(chunksize: number, timeend: number) {
-    process.send!({
+    sendMsg({
         command: 'setChunkSize',
         chunksize: chunksize,
         timeend: timeend
@@ -79,7 +107,7 @@ function setChunkSize(chunksize: number, timeend: number) {
 }
 
 function fsdbVarCallback(name: string, type: string, encoding: string, path: string, netlistId: NetlistId, signalId: SignalId, width: number, msb: number, lsb: number) {
-    process.send!({
+    sendMsg({
         command: 'fsdb-var-callback',
         name: name,
         type: type,
@@ -94,7 +122,7 @@ function fsdbVarCallback(name: string, type: string, encoding: string, path: str
 }
 
 function fsdbArrayBeginCallback(name: string, path: string, netlistId: number) {
-    process.send!({
+    sendMsg({
         command: 'fsdb-array-begin-callback',
         name: name,
         path: path,
@@ -103,7 +131,7 @@ function fsdbArrayBeginCallback(name: string, path: string, netlistId: number) {
 }
 
 function fsdbArrayEndCallback(size: number) {
-    process.send!({
+    sendMsg({
         command: 'fsdb-array-end-callback',
         size: size,
     });

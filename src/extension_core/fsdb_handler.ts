@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import type { EnumQueueEntry, SignalId, NetlistId, ValueChangeDataChunk } from '../common/types';
-import { type ChildProcess, fork } from 'child_process';
+import { type ChildProcess, fork, exec, spawn } from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';
 
 import type { VaporviewDocumentDelegate } from './viewer_provider';
 import { type NetlistItem, createScope, createVar } from './tree_view';
@@ -26,6 +27,13 @@ export class FsdbFormatHandler implements WaveformFileParser {
   private fsdbCurrentScope: NetlistItem | undefined = undefined;
   // Need a reference to findTreeItem for getValuesAtTime
   private findTreeItemFn: (scopePath: string, msb: number | undefined, lsb: number | undefined) => Promise<NetlistItem | null>;
+
+  // SSH remote mode
+  private isSSHRemote: boolean = false;
+  private sshHost: string = '';
+  private remoteWorkerDir: string = '';
+  private stdioMessageListeners: Array<(msg: any) => void> = [];
+  private readonly sshOpts = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new'];
 
   // Top level netlist items
   public netlistSearchable: boolean = false;
@@ -56,47 +64,526 @@ export class FsdbFormatHandler implements WaveformFileParser {
     this.findTreeItemFn = findTreeItemFn;
   }
 
-  async loadNetlist(): Promise<void> {
-    if (process.platform !== 'linux') {
-      vscode.window.showErrorMessage("FSDB support is currently available on Linux only.");
-      return;
+  // #region SSH Remote Methods
+
+  private detectSSHRemote(): { sshHost: string } | undefined {
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const uriAuthority = this.uri.authority;
+    if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:detectSSH] platform=${process.platform}, uri.scheme=${this.uri.scheme}, uri.authority=${uriAuthority}`); }
+    if (process.platform === 'linux') {
+      if (_dwf) { this.providerDelegate.logOutputChannel('[WF:detectSSH] platform is linux — local mode'); }
+      return undefined;
+    }
+    if (uriAuthority && uriAuthority.startsWith('ssh-remote+')) {
+      const host = uriAuthority.replace('ssh-remote+', '');
+      if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:detectSSH] SSH remote detected — host=${host}`); }
+      return { sshHost: host };
+    }
+    if (_dwf) { this.providerDelegate.logOutputChannel('[WF:detectSSH] not linux and not SSH remote — no FSDB support'); }
+    return undefined;
+  }
+
+  private sshExec(sshHost: string, command: string, opts?: { stdin?: string; timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    const timeoutMs = opts?.timeoutMs ?? 30000;
+
+    return new Promise((resolve) => {
+      let args: string[];
+      let spawnOpts: any;
+      if (opts?.stdin) {
+        args = [...this.sshOpts, sshHost, 'bash -s'];
+        spawnOpts = { stdio: ['pipe', 'pipe', 'pipe'] };
+      } else {
+        args = [...this.sshOpts, sshHost, command];
+        spawnOpts = {};
+      }
+      if (_dwf) { log(`[WF:sshExec] spawn ssh ${args.join(' ')} (timeout=${timeoutMs}ms)`); }
+
+      let proc: ChildProcess;
+      try {
+        proc = spawn('ssh', args, spawnOpts);
+      } catch (e: any) {
+        log(`[FSDB:SSH] failed to spawn ssh: ${e.message}`);
+        resolve({ ok: false, stdout: '', stderr: `spawn failed: ${e.message}`, code: null });
+        return;
+      }
+
+      if (opts?.stdin) {
+        proc.stdin!.write(opts.stdin);
+        proc.stdin!.end();
+      }
+
+      let stdout = '', stderr = '';
+      let settled = false;
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          log(`[FSDB:SSH] command timed out after ${timeoutMs}ms — killing process`);
+          proc.kill('SIGKILL');
+          resolve({ ok: false, stdout, stderr: stderr + '\n[TIMED OUT]', code: null });
+        }
+      }, timeoutMs);
+
+      proc.stdout?.on('data', (d: Buffer) => { stdout += d.toString(); });
+      proc.stderr?.on('data', (d: Buffer) => { stderr += d.toString(); });
+      proc.on('error', (err: Error) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          if (_dwf) { log(`[WF:sshExec] spawn error: ${err.message}`); }
+          resolve({ ok: false, stdout, stderr: `spawn error: ${err.message}`, code: null });
+        }
+      });
+      proc.on('close', (code) => {
+        if (!settled) {
+          settled = true;
+          clearTimeout(timer);
+          if (_dwf) { log(`[WF:sshExec] exited code=${code}`); }
+          resolve({ ok: code === 0, stdout, stderr, code });
+        }
+      });
+    });
+  }
+
+  private remoteUri(remotePath: string): vscode.Uri {
+    return vscode.Uri.parse(`vscode-remote://ssh-remote+${this.sshHost}${remotePath}`);
+  }
+
+  private async deployRemoteWorker(sshHost: string, fsdbLibsPath: string): Promise<string | undefined> {
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const remoteDir = '/tmp/.vaporview-fsdb';
+
+    const localWorkerPath = path.resolve(__dirname, 'fsdb_worker.js');
+    if (_dwf) { log(`[WF:deployRemote] localWorkerPath=${localWorkerPath} exists=${fs.existsSync(localWorkerPath)}`); }
+    if (!fs.existsSync(localWorkerPath)) {
+      log(`[FSDB:SSH] local worker not found at ${localWorkerPath}`);
+      vscode.window.showErrorMessage('FSDB worker file not found in extension bundle.');
+      return undefined;
+    }
+    const workerContent = fs.readFileSync(localWorkerPath, 'utf-8');
+    if (_dwf) { log(`[WF:deployRemote] workerContent length=${workerContent.length}`); }
+
+    const localCppPath = path.resolve(__dirname, '..', 'src', 'fsdb_reader.cpp');
+    const hasCpp = fs.existsSync(localCppPath);
+    if (_dwf) { log(`[WF:deployRemote] localCppPath=${localCppPath} exists=${hasCpp}`); }
+    const cppContent = hasCpp ? fs.readFileSync(localCppPath, 'utf-8') : '';
+
+    log(`[FSDB:SSH] deploying to ${sshHost}:${remoteDir} via VS Code remote filesystem`);
+
+    try {
+      await vscode.workspace.fs.createDirectory(this.remoteUri(`${remoteDir}/dist`));
+      if (hasCpp) {
+        await vscode.workspace.fs.createDirectory(this.remoteUri(`${remoteDir}/src`));
+      }
+      if (_dwf) { log('[WF:deployRemote] remote directories created'); }
+
+      await vscode.workspace.fs.writeFile(
+        this.remoteUri(`${remoteDir}/dist/fsdb_worker.js`),
+        Buffer.from(workerContent, 'utf-8')
+      );
+      if (_dwf) { log('[WF:deployRemote] fsdb_worker.js deployed'); }
+
+      if (hasCpp) {
+        await vscode.workspace.fs.writeFile(
+          this.remoteUri(`${remoteDir}/src/fsdb_reader.cpp`),
+          Buffer.from(cppContent, 'utf-8')
+        );
+        if (_dwf) { log('[WF:deployRemote] fsdb_reader.cpp deployed'); }
+      }
+      log(`[FSDB:SSH] deploy SUCCESS`);
+    } catch (err: any) {
+      log(`[FSDB:SSH] deploy via vscode.workspace.fs failed: ${err.message}`);
+      vscode.window.showErrorMessage(`Failed to deploy FSDB worker to remote: ${err.message}`);
+      return undefined;
     }
 
-    // Create FSDB worker that loads FSDB using node-addon-api
-    const fsdbReaderLibsPath = vscode.workspace.getConfiguration('vaporview').get('fsdbReaderLibsPath');
-    this.fsdbWorker = fork(path.resolve(__dirname, 'fsdb_worker.js'), {
-      env: {
-        ...process.env,
-        LD_LIBRARY_PATH: `${process.env.LD_LIBRARY_PATH ? process.env.LD_LIBRARY_PATH + ':' : ''}${fsdbReaderLibsPath}`
-      }
+    if (_dwf) { log('[WF:deployRemote] checking/building remote addon...'); }
+    const addonBuilt = await this.ensureRemoteAddon(sshHost, remoteDir, fsdbLibsPath);
+    if (_dwf) { log(`[WF:deployRemote] ensureRemoteAddon returned ${addonBuilt}`); }
+    if (!addonBuilt) { return undefined; }
+
+    return remoteDir;
+  }
+
+  private async ensureRemoteAddon(sshHost: string, remoteDir: string, fsdbLibsPath: string): Promise<boolean> {
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+
+    const addonRemotePath = `${remoteDir}/build/Release/fsdb_reader.node`;
+    if (_dwf) { log(`[WF:remoteAddon] checking remote addon via vscode.workspace.fs: ${addonRemotePath}`); }
+    try {
+      await vscode.workspace.fs.stat(this.remoteUri(addonRemotePath));
+      log(`[FSDB:SSH] addon already exists on remote`);
+      return true;
+    } catch {
+      // File does not exist — proceed with build
+    }
+    log(`[FSDB:SSH] addon not found on remote — will attempt build`);
+
+    let headerResult = '';
+    const posixPath = path.posix;
+    if (fsdbLibsPath.includes('/share/FsdbReader/')) {
+      headerResult = posixPath.dirname(fsdbLibsPath);
+    } else if (fsdbLibsPath.includes('/tools.lnx86/')) {
+      const toolsIdx = fsdbLibsPath.indexOf('/tools.lnx86/');
+      headerResult = fsdbLibsPath.substring(0, toolsIdx) + '/tools.lnx86/include';
+    }
+    if (_dwf) { log(`[WF:remoteAddon] derived headerPath=${headerResult || '(empty)'} from fsdbLibsPath=${fsdbLibsPath}`); }
+
+    if (!headerResult) {
+      log(`[FSDB:SSH] cannot derive header path from fsdbLibsPath=${fsdbLibsPath}`);
+      vscode.window.showErrorMessage(
+        'Cannot determine FSDB header path from libraries path. ' +
+        'Ensure vaporview.fsdbReaderLibsPath is set to a valid Verdi (.../share/FsdbReader/linux64) ' +
+        'or Xcelium (.../tools.lnx86/lib/64bit) libraries path.'
+      );
+      return false;
+    }
+
+    try {
+      await vscode.workspace.fs.stat(this.remoteUri(headerResult));
+      if (_dwf) { log(`[WF:remoteAddon] header path verified on remote`); }
+    } catch {
+      log(`[FSDB:SSH] header path ${headerResult} not found on remote`);
+      vscode.window.showErrorMessage(
+        `FSDB header directory not found at ${headerResult} on ${sshHost}. ` +
+        'Check that vaporview.fsdbReaderLibsPath points to a valid FSDB installation.'
+      );
+      return false;
+    }
+
+    const bindingGyp = JSON.stringify({
+      variables: { FSDB_READER_LIBS_PATH: fsdbLibsPath, FSDB_HEADER_PATH: headerResult },
+      targets: [{
+        target_name: "fsdb_reader",
+        "cflags!": ["-fno-exceptions"], cflags: ["-fPIC"],
+        "cflags_cc!": ["-fno-exceptions"], cflags_cc: ["-fPIC"],
+        sources: ["src/fsdb_reader.cpp"],
+        include_dirs: [
+          "<!@(node -p \"require('node-addon-api').include\")",
+          "<(FSDB_HEADER_PATH)>"
+        ],
+        defines: ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+        ldflags: ["-L<(FSDB_READER_LIBS_PATH)>", "-static-libstdc++"],
+        libraries: ["-lnffr", "-lnsys"]
+      }]
+    }, null, 2);
+    if (_dwf) { log(`[WF:remoteAddon] binding.gyp:\n${bindingGyp}`); }
+
+    if (_dwf) { log('[WF:remoteAddon] starting remote build via SSH...'); }
+    const buildStartTime = Date.now();
+    const buildResult = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: "Building FSDB reader addon on remote (this may take a minute)...",
+      cancellable: false
+    }, () => {
+      const buildScript = `source ~/.profile 2>/dev/null; source ~/.bash_profile 2>/dev/null; cd ${remoteDir} && npm install node-addon-api && cat > binding.gyp << 'VAPORVIEW_EOF'\n${bindingGyp}\nVAPORVIEW_EOF\nnpx node-gyp rebuild`;
+      return this.sshExec(sshHost, '', { stdin: buildScript, timeoutMs: 120000 });
     });
+
+    const elapsed = ((Date.now() - buildStartTime) / 1000).toFixed(1);
+    if (!buildResult.ok) {
+      log(`[FSDB:SSH] remote build FAILED after ${elapsed}s (exit ${buildResult.code})`);
+      log(`[FSDB:SSH] stdout:\n${buildResult.stdout}`);
+      log(`[FSDB:SSH] stderr:\n${buildResult.stderr}`);
+      vscode.window.showErrorMessage('Failed to build FSDB addon on remote. Check Vaporview output for details.');
+    } else {
+      log(`[FSDB:SSH] remote build SUCCESS after ${elapsed}s`);
+      if (_dwf) { log(`[WF:remoteAddon] build stdout:\n${buildResult.stdout}`); }
+    }
+    return buildResult.ok;
+  }
+
+  private spawnRemoteWorker(sshHost: string, remoteDir: string, fsdbLibsPath: string): ChildProcess {
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const ldPath = fsdbLibsPath;
+    const workerScript = `${remoteDir}/dist/fsdb_worker.js`;
+    const innerCmd = `cd ${remoteDir} && LD_LIBRARY_PATH=${ldPath}:\\$LD_LIBRARY_PATH NOVAS_FSDB_LOG=0 exec node ${workerScript}`;
+    const sshCmd = `bash --login -c '${innerCmd}'`;
+    if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:spawnRemote] ssh ${sshHost} — ${sshCmd}`); }
+    const proc = spawn('ssh', [...this.sshOpts, sshHost, sshCmd], { stdio: ['pipe', 'pipe', 'pipe'] });
+    if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:spawnRemote] spawned pid=${proc.pid}`); }
+    return proc;
+  }
+
+  // #region Local Auto-Build
+
+  private async ensureFsdbAddon(vaporviewRoot: string, fsdbLibsPath: string): Promise<boolean> {
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    const dbg = process.env.CRISP_DEV_WF_FSDB === '1';
+
+    log(`[FSDB] ensureFsdbAddon: vaporviewRoot=${vaporviewRoot}, fsdbLibsPath=${fsdbLibsPath}`);
+
+    const addonPath = path.join(vaporviewRoot, 'build', 'Release', 'fsdb_reader.node');
+    log(`[FSDB] checking addon at ${addonPath}`);
+    if (fs.existsSync(addonPath)) {
+      log(`[FSDB] addon already exists — skip build`);
+      return true;
+    }
+    log(`[FSDB] addon NOT found — will attempt auto-build`);
+
+    const verdiHome = process.env.VERDI_HOME;
+    const xceliumHome = process.env.XCELIUM_HOME;
+    let fsdbHeaderPath: string;
+
+    log(`[FSDB] VERDI_HOME=${verdiHome ?? '(unset)'}, XCELIUM_HOME=${xceliumHome ?? '(unset)'}`);
+
+    if (verdiHome) {
+      fsdbHeaderPath = path.join(verdiHome, 'share', 'FsdbReader');
+    } else if (xceliumHome) {
+      fsdbHeaderPath = path.join(xceliumHome, 'tools.lnx86', 'include');
+    } else {
+      log(`[FSDB] no env vars set — cannot auto-build, skipping (worker will handle error)`);
+      return true;
+    }
+    log(`[FSDB] resolved fsdbHeaderPath=${fsdbHeaderPath}`);
+
+    const missing: string[] = [];
+    const libNffr = path.join(fsdbLibsPath, 'libnffr.so');
+    const libNsys = path.join(fsdbLibsPath, 'libnsys.so');
+    const ffrApi = path.join(fsdbHeaderPath, 'ffrAPI.h');
+    log(`[FSDB] validating: libnffr=${libNffr} exists=${fs.existsSync(libNffr)}`);
+    log(`[FSDB] validating: libnsys=${libNsys} exists=${fs.existsSync(libNsys)}`);
+    log(`[FSDB] validating: ffrAPI.h=${ffrApi} exists=${fs.existsSync(ffrApi)}`);
+    if (!fs.existsSync(libNffr)) {
+      missing.push(`libnffr.so not found at ${fsdbLibsPath}/`);
+    }
+    if (!fs.existsSync(libNsys)) {
+      missing.push(`libnsys.so not found at ${fsdbLibsPath}/`);
+    }
+    if (!fs.existsSync(ffrApi)) {
+      missing.push(`ffrAPI.h not found at ${fsdbHeaderPath}/`);
+    }
+    if (missing.length > 0) {
+      log(`[FSDB] validation FAILED — missing: ${JSON.stringify(missing)}`);
+      vscode.window.showErrorMessage(
+        "Cannot auto-build FSDB reader addon. Missing files:\n" + missing.join("\n")
+      );
+      return false;
+    }
+    log(`[FSDB] all required files present — proceeding to build`);
+
+    const bindingGyp = JSON.stringify({
+      variables: {
+        FSDB_READER_LIBS_PATH: fsdbLibsPath,
+        FSDB_HEADER_PATH: fsdbHeaderPath
+      },
+      targets: [{
+        target_name: "fsdb_reader",
+        "cflags!": ["-fno-exceptions"],
+        cflags: ["-fPIC"],
+        "cflags_cc!": ["-fno-exceptions"],
+        cflags_cc: ["-fPIC"],
+        sources: ["src/fsdb_reader.cpp"],
+        include_dirs: [
+          "<!@(node -p \"require('node-addon-api').include\")",
+          "<(FSDB_HEADER_PATH)>"
+        ],
+        defines: ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+        ldflags: [
+          "-L<(FSDB_READER_LIBS_PATH)>",
+          "-static-libstdc++"
+        ],
+        libraries: [
+          "-lnffr",
+          "-lnsys"
+        ]
+      }]
+    }, null, 2);
+
+    const bindingGypPath = path.join(vaporviewRoot, 'binding.gyp');
+    log(`[FSDB] writing binding.gyp to ${bindingGypPath}`);
+    if (dbg) { log(`[FSDB] binding.gyp content:\n${bindingGyp}`); }
+    fs.writeFileSync(bindingGypPath, bindingGyp);
+
+    const buildCmd = 'npx node-gyp rebuild';
+    log(`[FSDB] running: ${buildCmd}  cwd=${vaporviewRoot}`);
+    const buildStartTime = Date.now();
+    const BUILD_TIMEOUT_MS = 120_000;
+
+    const buildSuccess = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification,
+      title: "Building FSDB reader addon (this may take a minute)...",
+      cancellable: false
+    }, () => {
+      return new Promise<boolean>((resolve) => {
+        const child = exec(buildCmd, { cwd: vaporviewRoot, timeout: BUILD_TIMEOUT_MS }, (error, stdout, stderr) => {
+          const elapsed = ((Date.now() - buildStartTime) / 1000).toFixed(1);
+          if (error) {
+            log(`[FSDB] build FAILED after ${elapsed}s — exit code=${error.code}, signal=${error.signal}`);
+            if (error.killed) { log(`[FSDB] build process was killed (timeout=${BUILD_TIMEOUT_MS}ms)`); }
+            log(`[FSDB] build stdout:\n${stdout}`);
+            log(`[FSDB] build stderr:\n${stderr}`);
+            const output = (stdout + '\n' + stderr).trim();
+            vscode.window.showErrorMessage(
+              "Failed to build FSDB reader addon. Check VaporView output for details.\n" + output.slice(-300)
+            );
+            resolve(false);
+          } else {
+            log(`[FSDB] build SUCCESS after ${elapsed}s`);
+            if (dbg) { log(`[FSDB] build stdout:\n${stdout}`); }
+            if (dbg && stderr) { log(`[FSDB] build stderr:\n${stderr}`); }
+            const addonExists = fs.existsSync(addonPath);
+            log(`[FSDB] post-build addon exists=${addonExists} at ${addonPath}`);
+            if (!addonExists) {
+              vscode.window.showErrorMessage("FSDB reader addon build completed but fsdb_reader.node was not produced.");
+            }
+            resolve(addonExists);
+          }
+        });
+        log(`[FSDB] build process spawned, pid=${child.pid}`);
+      });
+    });
+
+    log(`[FSDB] ensureFsdbAddon result=${buildSuccess}`);
+    return buildSuccess;
+  }
+
+  // #region loadNetlist
+
+  async loadNetlist(): Promise<void> {
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    try {
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] START — platform=' + process.platform + ' uri.authority=' + (this.uri.authority ?? '(none)') + ' uri.scheme=' + this.uri.scheme); }
+
+    // Detect if we're on a non-Linux platform with SSH remote workspace
+    const sshInfo = this.detectSSHRemote();
+    if (process.platform !== 'linux' && !sshInfo) {
+      vscode.window.showErrorMessage("FSDB support requires a Linux environment. Use VS Code Remote SSH to connect to a Linux workspace.");
+      return;
+    }
+    this.isSSHRemote = !!sshInfo;
+    if (sshInfo) {
+      this.sshHost = sshInfo.sshHost;
+      log(`[FSDB] SSH remote mode: host=${this.sshHost}`);
+    }
+
+    // Resolve FSDB libs path
+    let fsdbReaderLibsPath = vscode.workspace.getConfiguration('vaporview').get<string>('fsdbReaderLibsPath');
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] configured fsdbReaderLibsPath=' + (fsdbReaderLibsPath ?? '(not set)')); }
+
+    if (!fsdbReaderLibsPath) {
+      if (this.isSSHRemote) {
+        if (_dwf) { log('[WF:FsdbHandler.loadNetlist] querying remote env vars for libs path via sshExec...'); }
+        const envResult = await this.sshExec(this.sshHost,
+          `bash --login -c 'if [ -n "$VERDI_HOME" ]; then echo "$VERDI_HOME/share/FsdbReader/linux64"; elif [ -n "$XCELIUM_HOME" ]; then echo "$XCELIUM_HOME/tools.lnx86/lib/64bit"; else echo ""; fi'`,
+          { timeoutMs: 15000 }
+        );
+        if (_dwf) { log(`[WF:FsdbHandler.loadNetlist] SSH env query: ok=${envResult.ok} stdout='${envResult.stdout.trim()}' stderr='${envResult.stderr.trim()}'`); }
+        if (envResult.ok && envResult.stdout.trim()) {
+          fsdbReaderLibsPath = envResult.stdout.trim();
+          log(`[FSDB] libs path from remote env: ${fsdbReaderLibsPath}`);
+        } else if (!envResult.ok) {
+          log(`[FSDB] SSH env query failed (code=${envResult.code}): ${envResult.stderr.trim()}`);
+        }
+      } else {
+        const verdiHome = process.env.VERDI_HOME;
+        const xceliumHome = process.env.XCELIUM_HOME;
+        if (_dwf) { log('[WF:FsdbHandler.loadNetlist] VERDI_HOME=' + (verdiHome ?? '(unset)') + ' XCELIUM_HOME=' + (xceliumHome ?? '(unset)')); }
+        if (verdiHome) {
+          fsdbReaderLibsPath = path.join(verdiHome, 'share', 'FsdbReader', 'linux64');
+        } else if (xceliumHome) {
+          fsdbReaderLibsPath = path.join(xceliumHome, 'tools.lnx86', 'lib', '64bit');
+        }
+      }
+      if (!fsdbReaderLibsPath) {
+        const setupGuide = this.isSSHRemote
+          ? `To open FSDB files on a remote machine, set "vaporview.fsdbReaderLibsPath" in VS Code settings ` +
+            `to the FSDB reader libraries path on ${this.sshHost} ` +
+            `(e.g. /path/to/verdi/share/FsdbReader/linux64 or /path/to/xcelium/tools.lnx86/lib/64bit). ` +
+            `You also need SSH key-based authentication configured for ${this.sshHost} (ssh-copy-id).`
+          : `Export VERDI_HOME or XCELIUM_HOME in your environment before launching VS Code. ` +
+            `For example: export VERDI_HOME=/path/to/verdi. ` +
+            `Alternatively, set vaporview.fsdbReaderLibsPath in VS Code settings.`;
+        log(`[FSDB] no libs path resolved — showing guidance`);
+        vscode.window.showErrorMessage(
+          `FSDB reader libraries not found. ${setupGuide}`,
+          { modal: true }
+        );
+        return;
+      }
+    }
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] resolved fsdbReaderLibsPath=' + fsdbReaderLibsPath); }
+
+    // For SSH remote, resolve the file path as a POSIX path (uri.fsPath uses Windows backslashes)
+    const fsdbFilePath = this.isSSHRemote ? this.uri.path : this.uri.fsPath;
+    if (_dwf) { log(`[WF:FsdbHandler.loadNetlist] fsdbFilePath=${fsdbFilePath} (uri.fsPath=${this.uri.fsPath}, uri.path=${this.uri.path})`); }
+
+    if (this.isSSHRemote) {
+      // SSH remote path: deploy worker + build addon on remote, then spawn via SSH
+      const remoteDir = await this.deployRemoteWorker(this.sshHost, fsdbReaderLibsPath);
+      if (!remoteDir) { return; }
+      this.remoteWorkerDir = remoteDir;
+
+      log(`[FSDB] spawning remote worker via SSH on ${this.sshHost}`);
+      this.fsdbWorker = this.spawnRemoteWorker(this.sshHost, remoteDir, fsdbReaderLibsPath);
+      if (_dwf) { log('[WF:FsdbHandler.loadNetlist] SSH worker spawned, pid=' + this.fsdbWorker.pid); }
+    } else {
+      // Local Linux path: auto-build addon + fork worker
+      const vaporviewRoot = path.resolve(__dirname, '..');
+      log(`[FSDB] load: __dirname=${__dirname}, vaporviewRoot=${vaporviewRoot}, fsdbReaderLibsPath=${fsdbReaderLibsPath}`);
+      const addonReady = await this.ensureFsdbAddon(vaporviewRoot, fsdbReaderLibsPath);
+      log(`[FSDB] load: ensureFsdbAddon returned ${addonReady}`);
+      if (!addonReady) {
+        log(`[FSDB] load: addon not ready — aborting load`);
+        return;
+      }
+
+      const workerPath = path.resolve(__dirname, 'fsdb_worker.js');
+      if (_dwf) { log('[WF:FsdbHandler.loadNetlist] forking worker: ' + workerPath); }
+      this.fsdbWorker = fork(workerPath, {
+        env: {
+          ...process.env,
+          LD_LIBRARY_PATH: `${process.env.LD_LIBRARY_PATH ? process.env.LD_LIBRARY_PATH + ':' : ''}${fsdbReaderLibsPath}`,
+          NOVAS_FSDB_LOG: '0'
+        }
+      });
+      if (_dwf) { log('[WF:FsdbHandler.loadNetlist] worker forked, pid=' + this.fsdbWorker.pid); }
+    }
+
     this.fsdbWorker.setMaxListeners(50);
     this.setupFsdbWorkerListeners();
 
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] sending openFsdb command with path=' + fsdbFilePath); }
     await this.callFsdbWorkerTask({
       command: 'openFsdb',
-      fsdbPath: this.uri.fsPath
+      fsdbPath: fsdbFilePath
     });
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] openFsdb done'); }
 
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] sending readScopes command...'); }
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
-      title: "Reading Scopes for " + this.uri.fsPath,
+      title: "Reading Scopes for " + path.basename(fsdbFilePath),
       cancellable: false
     }, async () => {
       await this.callFsdbWorkerTask({
         command: 'readScopes'
       });
     });
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] readScopes done'); }
 
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] sending readMetadata command...'); }
     await vscode.window.withProgress({
       location: vscode.ProgressLocation.Notification,
-      title: "Reading Metadata for " + this.uri.fsPath,
+      title: "Reading Metadata for " + path.basename(fsdbFilePath),
       cancellable: false
     }, async () => {
       await this.callFsdbWorkerTask({
         command: 'readMetadata'
       });
     });
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] readMetadata done'); }
+
+    if (_dwf) { log('[WF:FsdbHandler.loadNetlist] DONE'); }
+
+    } catch (err: any) {
+      log(`[FSDB] loadNetlist() exception: ${err?.message ?? err}\n${err?.stack ?? ''}`);
+      vscode.window.showErrorMessage(`FSDB load error: ${err?.message ?? err}`);
+    }
   }
 
   async loadBody(): Promise<void> {
@@ -104,31 +591,73 @@ export class FsdbFormatHandler implements WaveformFileParser {
     return;
   }
 
+  // #region Worker Communication
+
   private setupFsdbWorkerListeners(): void {
     if (!this.fsdbWorker) return;
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
 
-    this.fsdbWorker.on('online', () => {
-      console.log('FSDB worker is online.');
-    });
+    if (_dwf) { log(`[WF:setupListeners] isSSHRemote=${this.isSSHRemote} pid=${this.fsdbWorker.pid}`); }
 
     this.fsdbWorker.on('error', (err: Error) => {
-      console.error('FSDB worker error:', err);
+      log('[FSDB] worker error: ' + err.message);
     });
 
     this.fsdbWorker.on('exit', (code: any, signal: any) => {
-      if (code !== 0) {
-        console.error(`Child process exited with error code ${code} (signal: ${signal})`);
-      }
+      log(`[FSDB] worker exited with code ${code} (signal: ${signal})`);
     });
 
-    this.fsdbWorker.on('message', (msg: any) => {
-      this.handleMessage(msg);
-    });
+    if (this.isSSHRemote) {
+      if (_dwf) { log('[WF:setupListeners] setting up SSH/stdio message parsing on stdout'); }
+      // SSH mode: parse newline-delimited JSON from stdout
+      let buf = '';
+      let msgCount = 0;
+      this.fsdbWorker.stdout!.setEncoding('utf-8');
+      this.fsdbWorker.stdout!.on('data', (chunk: string) => {
+        buf += chunk;
+        let nl;
+        while ((nl = buf.indexOf('\n')) !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim()) {
+            try {
+              const msg = JSON.parse(line);
+              msgCount++;
+              if (_dwf && msgCount <= 5) { log(`[WF:stdio:rx#${msgCount}] command=${msg.command ?? '(response)'} id=${msg.id ?? '(none)'}`); }
+              if (_dwf && msgCount === 6) { log('[WF:stdio:rx] (further messages suppressed)'); }
+              this.handleMessage(msg);
+              // Also notify callFsdbWorkerTask listeners
+              for (const listener of this.stdioMessageListeners) {
+                listener(msg);
+              }
+            } catch (e: any) {
+              log('[FSDB:SSH] failed to parse worker output: ' + e.message + ' line: ' + line.slice(0, 200));
+            }
+          }
+        }
+      });
+      // Log stderr from remote worker
+      this.fsdbWorker.stderr!.setEncoding('utf-8');
+      this.fsdbWorker.stderr!.on('data', (chunk: string) => {
+        log('[FSDB:SSH:stderr] ' + chunk.trim());
+      });
+    } else {
+      if (_dwf) { log('[WF:setupListeners] setting up IPC message listeners'); }
+      // IPC mode (fork): use built-in message channel
+      this.fsdbWorker.on('online', () => {
+        log('[FSDB] worker is online.');
+      });
+      this.fsdbWorker.on('message', (msg: any) => {
+        this.handleMessage(msg);
+      });
+    }
   }
 
   private handleMessage(message: any) {
     switch (message.command) {
       case 'require-failed': {
+        this.providerDelegate.logOutputChannel(`[FSDB] require-failed: ${JSON.stringify(message.error)}`);
         vscode.window.showErrorMessage("Failed to load FSDB reader, is vaporview.fsdbReaderLibsPath properly set? (" + message.error.code + ")");
         break;
       }
@@ -141,7 +670,6 @@ export class FsdbFormatHandler implements WaveformFileParser {
         break;
       }
       case 'setMetadata': {
-        //this.delegate.setMetadata(message.scopecount, message.varcount, message.timescale, message.timeunit);
         this.metadata.scopeCount = message.scopecount;
         this.metadata.netlistIdCount = message.varcount;
         this.metadata.timeScale = message.timescale;
@@ -150,7 +678,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
       }
       case 'setChunkSize': {
         this.metadata.timeEnd = Number(message.timeend);
-        this.metadata.timeTableCount = Number(message.timetablelength);
+        this.metadata.timeTableCount = 0; // FSDB addon does not provide timeTableCount
         this.metadata.timeTableLoaded = true;
         this.metadata.chunkSize = Number(message.chunksize);
         break;
@@ -172,26 +700,55 @@ export class FsdbFormatHandler implements WaveformFileParser {
   }
 
   private callFsdbWorkerTask(message: any): Promise<any> {
-    if (this.fsdbWorker === undefined) return Promise.resolve([]);
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    if (this.fsdbWorker === undefined) {
+      if (_dwf) { this.providerDelegate.logOutputChannel('[WF:callTask] worker is undefined — returning empty'); }
+      return Promise.resolve([]);
+    }
     return new Promise((resolve, reject) => {
       const id = Math.random().toString(36).substring(2, 9);
       message.id = id;
+      if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] command=${message.command} id=${id} mode=${this.isSSHRemote ? 'SSH' : 'IPC'}`); }
+      const taskStartTime = Date.now();
 
-      const messageHandler = (message: any) => {
-        if (message.id === id) {
-          this.fsdbWorker!.off('message', messageHandler);
-          if (message.error) {
-            console.log(message.error);
-            return reject(new Error(message.error));
+      if (this.isSSHRemote) {
+        // SSH/stdio mode: listen via stdioMessageListeners, send via stdin
+        const handler = (msg: any) => {
+          if (msg.id === id) {
+            const idx = this.stdioMessageListeners.indexOf(handler);
+            if (idx >= 0) { this.stdioMessageListeners.splice(idx, 1); }
+            if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] response for ${message.command} id=${id} elapsed=${Date.now() - taskStartTime}ms`); }
+            if (msg.error) {
+              if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${msg.error}`); }
+              return reject(new Error(msg.error));
+            }
+            resolve(msg);
           }
-          resolve(message);
-        }
-      };
-
-      this.fsdbWorker!.on('message', messageHandler);
-      this.fsdbWorker!.send(message);
+        };
+        this.stdioMessageListeners.push(handler);
+        const payload = JSON.stringify(message) + '\n';
+        if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] writing to stdin (${payload.length} bytes)`); }
+        this.fsdbWorker!.stdin!.write(payload);
+      } else {
+        // IPC mode (fork): use built-in message channel
+        const messageHandler = (message: any) => {
+          if (message.id === id) {
+            this.fsdbWorker!.off('message', messageHandler);
+            if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] IPC response id=${id} elapsed=${Date.now() - taskStartTime}ms`); }
+            if (message.error) {
+              if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${message.error}`); }
+              return reject(new Error(message.error));
+            }
+            resolve(message);
+          }
+        };
+        this.fsdbWorker!.on('message', messageHandler);
+        this.fsdbWorker!.send(message);
+      }
     });
   }
+
+  // #region Other Methods (unchanged signatures)
 
   private async fsdbReadVars(element: NetlistItem | undefined) {
     if (!element) return;
@@ -303,22 +860,34 @@ export class FsdbFormatHandler implements WaveformFileParser {
   }
 
   async unload(): Promise<void> {
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    if (_dwf) { this.providerDelegate.logOutputChannel('[WF:FSDB:unload] START isSSHRemote=' + this.isSSHRemote + ' workerPid=' + this.fsdbWorker?.pid); }
+
     await this.callFsdbWorkerTask({ command: 'unload' });
     if (this.fsdbWorker !== undefined) {
-      this.fsdbWorker.disconnect();
+      if (this.isSSHRemote) {
+        if (_dwf) { this.providerDelegate.logOutputChannel('[WF:FSDB:unload] killing SSH worker pid=' + this.fsdbWorker.pid); }
+        this.fsdbWorker.kill();
+      } else {
+        if (_dwf) { this.providerDelegate.logOutputChannel('[WF:FSDB:unload] disconnecting IPC worker pid=' + this.fsdbWorker.pid); }
+        this.fsdbWorker.disconnect();
+      }
       this.fsdbWorker = undefined;
     }
+    this.stdioMessageListeners = [];
     this.fsdbTopModuleCount = 0;
     this.fsdbCurrentScope = undefined;
     this.parametersLoaded = false;
     this.netlistTop = [];
+    if (_dwf) { this.providerDelegate.logOutputChannel('[WF:FSDB:unload] DONE'); }
   }
 
   dispose(): void {
     this.unload();
   }
 
-  // FSDB callback methods
+  // #region FSDB callback methods
+
   private fsdbScopeCallback(name: string, type: string, path: string, netlistId: number, scopeOffsetIdx: number) {
     const scopePath = path.split('.');
     this.netlistTop.push(createScope(name, type, scopePath, netlistId, scopeOffsetIdx, this.uri));
@@ -340,7 +909,6 @@ export class FsdbFormatHandler implements WaveformFileParser {
     const scopePath = path.split('.');
     const varItem = createVar(name, paramValue, type, encoding, scopePath, netlistId, signalId, width, msb, lsb, enumType, true /*isFsdb*/, this.uri);
     this.fsdbCurrentScope!.children.push(varItem);
-    //this.delegate.netlistIdTable[varItem.netlistId] = varItem;
   }
 
   private fsdbArrayBeginCallback(name: string, path: string, netlistId: number) {
