@@ -12,6 +12,7 @@ import { SignalGroupContextMenuEvent } from '../common/types';
 export async function activate(context: vscode.ExtensionContext) {
 
   const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+  const _dfsdb = process.env.CRISP_DEV_DEBUG_FSDB === '1';
 
   // Load the Wasm module
   if (_dwf) { console.log('[WF:activate] loading WASM module...'); }
@@ -132,6 +133,57 @@ export async function activate(context: vscode.ExtensionContext) {
     const document = viewerProvider.getDocumentFromOptionalUri(e.uri);
     if (!document) {return;}
     return document.getValuesAtTime(e);
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.getMetadata', (e) => {
+    viewerProvider.log.appendLine("Command called: 'waveformViewer.getMetadata' " + JSON.stringify(e));
+    const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);
+    if (!document) {
+      if (_dfsdb) { console.log('[FSDB:cmd] getMetadata: no document found'); }
+      return null;
+    }
+    const result = document.getMetadataInfo();
+    if (_dfsdb) { console.log('[FSDB:cmd] getMetadata result:', JSON.stringify(result)); }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.getScopeChildren', async (e) => {
+    viewerProvider.log.appendLine("Command called: 'waveformViewer.getScopeChildren' " + JSON.stringify(e));
+    const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);
+    if (!document) {
+      if (_dfsdb) { console.log('[FSDB:cmd] getScopeChildren: no document found'); }
+      return null;
+    }
+    if (_dfsdb) { console.log('[FSDB:cmd] getScopeChildren scopePath=' + (e?.scopePath || '(root)')); }
+    const result = await document.getScopeChildrenSerialized(e?.scopePath);
+    if (_dfsdb) { console.log('[FSDB:cmd] getScopeChildren returned ' + result.length + ' children'); }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.getValueChanges', async (e) => {
+    viewerProvider.log.appendLine("Command called: 'waveformViewer.getValueChanges' " + JSON.stringify(e));
+    const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);
+    if (!document) {
+      if (_dfsdb) { console.log('[FSDB:cmd] getValueChanges: no document found'); }
+      return null;
+    }
+    if (_dfsdb) { console.log('[FSDB:cmd] getValueChanges instancePath=' + e.instancePath); }
+    const result = await document.getValueChangesForPath(e.instancePath);
+    if (_dfsdb) { console.log('[FSDB:cmd] getValueChanges returned ' + (result ? `${result.valueChanges?.length ?? 0} transitions` : 'null')); }
+    return result;
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.searchNetlistCommand', async (e) => {
+    viewerProvider.log.appendLine("Command called: 'waveformViewer.searchNetlistCommand' " + JSON.stringify(e));
+    const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);
+    if (!document) {
+      if (_dfsdb) { console.log('[FSDB:cmd] searchNetlistCommand: no document found'); }
+      return null;
+    }
+    if (_dfsdb) { console.log('[FSDB:cmd] searchNetlistCommand query="' + e.query + '"'); }
+    const result = await document.searchNetlist(e.query);
+    if (_dfsdb) { console.log('[FSDB:cmd] searchNetlistCommand returned ' + result.totalResults + ' results'); }
+    return result;
   }));
 
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.viewVaporViewSidebar', () => {

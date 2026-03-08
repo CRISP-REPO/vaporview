@@ -40,6 +40,7 @@ export interface WaveformFileParser {
   getEnumData(enumList: EnumQueueEntry[]): Promise<void>;
   getValuesAtTime(time: number, instancePaths: string[]): Promise<any>;
   searchNetlist(searchString: string): Promise<NetlistSearchResult>
+  getValueChangesForSignal?(signalId: SignalId): Promise<any>;
 
   // Callbacks
   postMessageToWebview(message: any): void;
@@ -679,6 +680,58 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
 
   public searchNetlist(searchQuery: string): Promise<NetlistSearchResult> {
     return this._handler.searchNetlist(searchQuery);
+  }
+
+  private static _dfsdb = process.env.CRISP_DEV_DEBUG_FSDB === '1';
+
+  public getMetadataInfo() {
+    const result = {
+      fileName: path.basename(this.uri.fsPath),
+      uri: this.uri.toString(),
+      ...this.metadata
+    };
+    if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getMetadataInfo:', JSON.stringify(result)); }
+    return result;
+  }
+
+  public async getScopeChildrenSerialized(scopePath?: string): Promise<any[]> {
+    if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getScopeChildrenSerialized scopePath=' + (scopePath || '(root)')); }
+    let element: NetlistItem | undefined;
+    if (scopePath) {
+      element = await this.findTreeItem(scopePath, undefined, undefined) ?? undefined;
+      if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] findTreeItem resolved:', element ? `netlistId=${element.netlistId}` : 'null'); }
+    }
+    const children = await this.getScopeChildren(element);
+    if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getScopeChildren returned ' + children.length + ' raw children'); }
+    return children.map(child => ({
+      name: child.name,
+      label: child.label as string,
+      type: child.type,
+      instancePath: child.instancePath(),
+      netlistId: child.netlistId,
+      signalId: child.signalId,
+      isScope: child.collapsibleState !== vscode.TreeItemCollapsibleState.None,
+      width: child.width,
+      msb: child.msb,
+      lsb: child.lsb,
+      encoding: child.encoding,
+    }));
+  }
+
+  public async getValueChangesForPath(instancePath: string): Promise<any> {
+    if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath instancePath=' + instancePath); }
+    const item = await this.findTreeItem(instancePath, undefined, undefined);
+    if (!item || item.signalId === 0) {
+      if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath: signal not found or signalId=0'); }
+      return null;
+    }
+    if (!this._handler.getValueChangesForSignal) {
+      if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath: handler does not support getValueChangesForSignal'); }
+      return null;
+    }
+    const result = await this._handler.getValueChangesForSignal(item.signalId);
+    if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath result: ' + (result ? `${result.valueChanges?.length ?? 0} transitions` : 'null')); }
+    return result;
   }
 
   public async unload(): Promise<void> {

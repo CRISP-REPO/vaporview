@@ -808,6 +808,13 @@ export class FsdbFormatHandler implements WaveformFileParser {
     await Promise.all(tasks);
   }
 
+  async getValueChangesForSignal(signalId: SignalId): Promise<any> {
+    await this.callFsdbWorkerTask({ command: 'loadSignals', signalIdList: [signalId] });
+    const result = await this.callFsdbWorkerTask({ command: 'getValueChanges', signalId: signalId });
+    const message = result as FsdbWorkerMessage;
+    return (message.result as FsdbWaveformData);
+  }
+
   async getEnumData(enumList: EnumQueueEntry[]): Promise<void> {
     // Not Implemented for FSDB
     // TODO(heyfey): Implement fetching enum data for FSDB
