@@ -17,6 +17,10 @@ export type WaveformDumpMetadata = {
   timeScale: number;
   timeUnit: string;
   chunkSize: number;
+  fileType?: string;
+  simVersion?: string;
+  simDate?: string;
+  maxVarIdcode?: number;
 };
 
 export type NetlistIdTable = NetlistItem[];
@@ -732,6 +736,19 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     const result = await this._handler.getValueChangesForSignal(item.signalId);
     if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath result: ' + (result ? `${result.valueChanges?.length ?? 0} transitions` : 'null')); }
     return result;
+  }
+
+  public async setViewWindow(startTime: number, endTime: number): Promise<void> {
+    if ((this._handler as any).setViewWindow) {
+      await (this._handler as any).setViewWindow(startTime, endTime);
+    }
+  }
+
+  public async getVarInfo(signalId: number): Promise<any> {
+    if ((this._handler as any).getVarInfo) {
+      return (this._handler as any).getVarInfo(signalId);
+    }
+    return null;
   }
 
   public async unload(): Promise<void> {

@@ -67,6 +67,8 @@ function handleMessage(message: any) {
         case 'getValueChanges': { return fsdbAddon.getValueChanges(message.signalId); }
         case 'getValuesAtTime': { return fsdbAddon.getValuesAtTime(message.signalId, message.time); }
         case 'unloadSignal': { fsdbAddon.unloadSignal(message.signalId); break; }
+        case 'setViewWindow': { fsdbAddon.setViewWindow(message.startTime, message.endTime); break; }
+        case 'getVarInfo': { return fsdbAddon.getVarInfo(message.signalId); }
         case 'unload': { fsdbAddon.unload(); break; }
     }
 }
@@ -88,13 +90,17 @@ function fsdbUpscopeCallback() {
     });
 }
 
-function setMetadata(scopecount: number, varcount: number, timescale: number, timeunit: string) {
+function setMetadata(scopecount: number, varcount: number, timescale: number, timeunit: string, fileType: string, simVersion: string, simDate: string, maxVarIdcode: number) {
     sendMsg({
         command: 'setMetadata',
         scopecount: scopecount,
         varcount: varcount,
         timescale: timescale,
-        timeunit: timeunit
+        timeunit: timeunit,
+        fileType: fileType,
+        simVersion: simVersion,
+        simDate: simDate,
+        maxVarIdcode: maxVarIdcode
     });
 }
 

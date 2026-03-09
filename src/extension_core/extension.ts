@@ -173,6 +173,21 @@ export async function activate(context: vscode.ExtensionContext) {
     return result;
   }));
 
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.setViewWindow', async (e) => {
+    viewerProvider.log.appendLine("Command called: 'waveformViewer.setViewWindow' " + JSON.stringify(e));
+    const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);
+    if (!document) { return null; }
+    await document.setViewWindow(e.startTime, e.endTime);
+    return { success: true };
+  }));
+
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.getVarInfo', async (e) => {
+    viewerProvider.log.appendLine("Command called: 'waveformViewer.getVarInfo' " + JSON.stringify(e));
+    const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);
+    if (!document) { return null; }
+    return document.getVarInfo(e.signalId);
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.searchNetlistCommand', async (e) => {
     viewerProvider.log.appendLine("Command called: 'waveformViewer.searchNetlistCommand' " + JSON.stringify(e));
     const document = viewerProvider.getDocumentFromOptionalUri(e?.uri);

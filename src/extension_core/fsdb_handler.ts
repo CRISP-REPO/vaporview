@@ -674,6 +674,10 @@ export class FsdbFormatHandler implements WaveformFileParser {
         this.metadata.netlistIdCount = message.varcount;
         this.metadata.timeScale = message.timescale;
         this.metadata.timeUnit = message.timeunit;
+        if (message.fileType) { this.metadata.fileType = message.fileType; }
+        if (message.simVersion) { this.metadata.simVersion = message.simVersion; }
+        if (message.simDate) { this.metadata.simDate = message.simDate; }
+        if (message.maxVarIdcode !== undefined) { this.metadata.maxVarIdcode = message.maxVarIdcode; }
         break;
       }
       case 'setChunkSize': {
@@ -866,6 +870,23 @@ export class FsdbFormatHandler implements WaveformFileParser {
     return result;
   }
 
+  async setViewWindow(startTime: number, endTime: number): Promise<void> {
+    await this.callFsdbWorkerTask({
+      command: 'setViewWindow',
+      startTime: startTime,
+      endTime: endTime
+    });
+  }
+
+  async getVarInfo(signalId: number): Promise<any> {
+    const result = await this.callFsdbWorkerTask({
+      command: 'getVarInfo',
+      signalId: signalId
+    });
+    const message = result as FsdbWorkerMessage;
+    return message.result;
+  }
+
   async unload(): Promise<void> {
     const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
     if (_dwf) { this.providerDelegate.logOutputChannel('[WF:FSDB:unload] START isSSHRemote=' + this.isSSHRemote + ' workerPid=' + this.fsdbWorker?.pid); }
@@ -896,7 +917,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
   // #region FSDB callback methods
 
   private fsdbScopeCallback(name: string, type: string, path: string, netlistId: number, scopeOffsetIdx: number) {
-    const scopePath = path.split('.');
+    const scopePath = path ? path.split('.') : [];
     this.netlistTop.push(createScope(name, type, scopePath, netlistId, scopeOffsetIdx, this.uri));
   }
 
@@ -913,13 +934,13 @@ export class FsdbFormatHandler implements WaveformFileParser {
   private fsdbVarCallback(name: string, type: string, encoding: string, path: string, netlistId: NetlistId, signalId: SignalId, width: number, msb: number, lsb: number) {
     const enumType = "";
     const paramValue = "";
-    const scopePath = path.split('.');
+    const scopePath = path ? path.split('.') : [];
     const varItem = createVar(name, paramValue, type, encoding, scopePath, netlistId, signalId, width, msb, lsb, enumType, true /*isFsdb*/, this.uri);
     this.fsdbCurrentScope!.children.push(varItem);
   }
 
   private fsdbArrayBeginCallback(name: string, path: string, netlistId: number) {
-    const scopePath = path.split('.');
+    const scopePath = path ? path.split('.') : [];
     this.fsdbCurrentScope!.children.push(createScope(name, "vhdlarray", scopePath, netlistId, -1, this.uri));
   }
 
@@ -935,8 +956,48 @@ export class FsdbFormatHandler implements WaveformFileParser {
     this.fsdbCurrentScope!.children.unshift(array);
   }
 
-  // TODO: @heyfey - implement netlist search
-  public searchNetlist(searchString: string): Promise<NetlistSearchResult> {
-    return Promise.resolve({totalResults: 0, searchResults: []});
+  private async loadAllVarsRecursive(items: NetlistItem[]): Promise<void> {
+    for (const item of items) {
+      if (item.collapsibleState !== vscode.TreeItemCollapsibleState.None && !item.fsdbVarLoaded) {
+        await this.fsdbReadVars(item);
+        item.fsdbVarLoaded = true;
+      }
+      if (item.children.length > 0) {
+        await this.loadAllVarsRecursive(item.children);
+      }
+    }
+  }
+
+  private collectSearchResults(items: NetlistItem[], query: string, results: NetlistSearchEntry[], maxResults: number): void {
+    for (const item of items) {
+      if (results.length >= maxResults) { return; }
+      const instancePath = item.instancePath();
+      if (instancePath.toLowerCase().includes(query)) {
+        const isVar = item.collapsibleState === vscode.TreeItemCollapsibleState.None;
+        results.push({
+          instancePath,
+          type: item.type,
+          isVar,
+          paramValue: item.paramValue || '',
+          msb: item.msb,
+          lsb: item.lsb,
+        });
+      }
+      if (item.children.length > 0 && results.length < maxResults) {
+        this.collectSearchResults(item.children, query, results, maxResults);
+      }
+    }
+  }
+
+  public async searchNetlist(searchString: string): Promise<NetlistSearchResult> {
+    if (!searchString) { return { totalResults: 0, searchResults: [] }; }
+    // Ensure all vars are loaded before searching
+    await this.loadAllVarsRecursive(this.netlistTop);
+    const maxResults = 200;
+    const results: NetlistSearchEntry[] = [];
+    const query = searchString.toLowerCase();
+    this.collectSearchResults(this.netlistTop, query, results, maxResults);
+    this.netlistSearchable = true;
+    return { totalResults: results.length, searchResults: results };
   }
 }
