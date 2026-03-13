@@ -3,6 +3,7 @@ import type { EnumQueueEntry, SignalId, NetlistId, ValueChangeDataChunk } from '
 import { type ChildProcess, fork, exec, spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
+import * as crypto from 'crypto';
 
 import type { VaporviewDocumentDelegate } from './viewer_provider';
 import { type NetlistItem, createScope, createVar } from './tree_view';
@@ -96,9 +97,9 @@ export class FsdbFormatHandler implements WaveformFileParser {
         spawnOpts = { stdio: ['pipe', 'pipe', 'pipe'] };
       } else {
         args = [...this.sshOpts, sshHost, command];
-        spawnOpts = {};
+        spawnOpts = { stdio: ['pipe', 'pipe', 'pipe'] };
       }
-      if (_dwf) { log(`[WF:sshExec] spawn ssh ${args.join(' ')} (timeout=${timeoutMs}ms)`); }
+      log(`[WF:sshExec] spawn ssh ${args.join(' ')} (timeout=${timeoutMs}ms)`);
 
       let proc: ChildProcess;
       try {
@@ -108,6 +109,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
         resolve({ ok: false, stdout: '', stderr: `spawn failed: ${e.message}`, code: null });
         return;
       }
+      log(`[WF:sshExec] spawned pid=${proc.pid} stdout=${!!proc.stdout} stderr=${!!proc.stderr} stdin=${!!proc.stdin}`);
 
       if (opts?.stdin) {
         proc.stdin!.write(opts.stdin);
@@ -153,7 +155,11 @@ export class FsdbFormatHandler implements WaveformFileParser {
   private async deployRemoteWorker(sshHost: string, fsdbLibsPath: string): Promise<string | undefined> {
     const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
     const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
-    const remoteDir = '/tmp/.vaporview-fsdb';
+
+    // Use workspace folder path instead of /tmp to avoid permission/path issues
+    const wsFolder = vscode.workspace.workspaceFolders?.[0];
+    const wsPath = wsFolder ? wsFolder.uri.path : '/tmp';
+    const remoteDir = `${wsPath}/.crisp-fsdb`;
 
     const localWorkerPath = path.resolve(__dirname, 'fsdb_worker.js');
     if (_dwf) { log(`[WF:deployRemote] localWorkerPath=${localWorkerPath} exists=${fs.existsSync(localWorkerPath)}`); }
@@ -170,12 +176,23 @@ export class FsdbFormatHandler implements WaveformFileParser {
     if (_dwf) { log(`[WF:deployRemote] localCppPath=${localCppPath} exists=${hasCpp}`); }
     const cppContent = hasCpp ? fs.readFileSync(localCppPath, 'utf-8') : '';
 
+    // Locate node-addon-api headers bundled with the extension
+    const napiDir = path.resolve(__dirname, '..', 'node_modules', 'node-addon-api');
+    const napiHeaders = ['napi.h', 'napi-inl.h', 'napi-inl.deprecated.h'];
+    const napiIndex = path.join(napiDir, 'index.js');
+    const hasNapi = fs.existsSync(napiIndex);
+    if (_dwf) { log(`[WF:deployRemote] napiDir=${napiDir} exists=${hasNapi}`); }
+
     log(`[FSDB:SSH] deploying to ${sshHost}:${remoteDir} via VS Code remote filesystem`);
 
     try {
       await vscode.workspace.fs.createDirectory(this.remoteUri(`${remoteDir}/dist`));
       if (hasCpp) {
         await vscode.workspace.fs.createDirectory(this.remoteUri(`${remoteDir}/src`));
+      }
+      // Deploy node-addon-api headers so we don't need npm install on the remote
+      if (hasNapi) {
+        await vscode.workspace.fs.createDirectory(this.remoteUri(`${remoteDir}/node_modules/node-addon-api`));
       }
       if (_dwf) { log('[WF:deployRemote] remote directories created'); }
 
@@ -192,6 +209,30 @@ export class FsdbFormatHandler implements WaveformFileParser {
         );
         if (_dwf) { log('[WF:deployRemote] fsdb_reader.cpp deployed'); }
       }
+
+      // Deploy node-addon-api: headers + index.js + package.json
+      if (hasNapi) {
+        for (const hdr of napiHeaders) {
+          const hdrPath = path.join(napiDir, hdr);
+          if (fs.existsSync(hdrPath)) {
+            await vscode.workspace.fs.writeFile(
+              this.remoteUri(`${remoteDir}/node_modules/node-addon-api/${hdr}`),
+              fs.readFileSync(hdrPath)
+            );
+          }
+        }
+        // index.js and package.json are needed for require('node-addon-api').include
+        for (const f of ['index.js', 'package.json']) {
+          const fPath = path.join(napiDir, f);
+          if (fs.existsSync(fPath)) {
+            await vscode.workspace.fs.writeFile(
+              this.remoteUri(`${remoteDir}/node_modules/node-addon-api/${f}`),
+              fs.readFileSync(fPath)
+            );
+          }
+        }
+        if (_dwf) { log('[WF:deployRemote] node-addon-api deployed'); }
+      }
       log(`[FSDB:SSH] deploy SUCCESS`);
     } catch (err: any) {
       log(`[FSDB:SSH] deploy via vscode.workspace.fs failed: ${err.message}`);
@@ -199,10 +240,38 @@ export class FsdbFormatHandler implements WaveformFileParser {
       return undefined;
     }
 
+    // Only rebuild if source has changed: compare hash of cpp content with stored marker
+    const sourceHash = crypto.createHash('sha1').update(cppContent).digest('hex');
+    const hashMarkerUri = this.remoteUri(`${remoteDir}/build/.source_hash`);
+    let needsRebuild = true;
+    try {
+      const remoteHash = Buffer.from(await vscode.workspace.fs.readFile(hashMarkerUri)).toString('utf-8').trim();
+      needsRebuild = remoteHash !== sourceHash;
+      if (_dwf) { log(`[WF:deployRemote] source hash: local=${sourceHash} remote=${remoteHash} needsRebuild=${needsRebuild}`); }
+    } catch {
+      if (_dwf) { log(`[WF:deployRemote] no source hash marker found — will build`); }
+    }
+
+    if (needsRebuild) {
+      // Delete old addon to force rebuild
+      try {
+        await vscode.workspace.fs.delete(this.remoteUri(`${remoteDir}/build/Release/fsdb_reader.node`));
+        if (_dwf) { log('[WF:deployRemote] deleted old addon to force rebuild'); }
+      } catch { /* doesn't exist — fine */ }
+    }
+
     if (_dwf) { log('[WF:deployRemote] checking/building remote addon...'); }
     const addonBuilt = await this.ensureRemoteAddon(sshHost, remoteDir, fsdbLibsPath);
     if (_dwf) { log(`[WF:deployRemote] ensureRemoteAddon returned ${addonBuilt}`); }
     if (!addonBuilt) { return undefined; }
+
+    // Store source hash so we skip rebuild next time if unchanged
+    if (needsRebuild) {
+      try {
+        await vscode.workspace.fs.createDirectory(this.remoteUri(`${remoteDir}/build`));
+        await vscode.workspace.fs.writeFile(hashMarkerUri, Buffer.from(sourceHash, 'utf-8'));
+      } catch { /* non-critical */ }
+    }
 
     return remoteDir;
   }
@@ -254,57 +323,154 @@ export class FsdbFormatHandler implements WaveformFileParser {
       return false;
     }
 
-    const bindingGyp = JSON.stringify({
-      variables: { FSDB_READER_LIBS_PATH: fsdbLibsPath, FSDB_HEADER_PATH: headerResult },
-      targets: [{
-        target_name: "fsdb_reader",
-        "cflags!": ["-fno-exceptions"], cflags: ["-fPIC"],
-        "cflags_cc!": ["-fno-exceptions"], cflags_cc: ["-fPIC"],
-        sources: ["src/fsdb_reader.cpp"],
-        include_dirs: [
-          "<!@(node -p \"require('node-addon-api').include\")",
-          "<(FSDB_HEADER_PATH)>"
-        ],
-        defines: ["NAPI_DISABLE_CPP_EXCEPTIONS"],
-        ldflags: ["-L<(FSDB_READER_LIBS_PATH)>", "-static-libstdc++"],
-        libraries: ["-lnffr", "-lnsys"]
-      }]
-    }, null, 2);
-    if (_dwf) { log(`[WF:remoteAddon] binding.gyp:\n${bindingGyp}`); }
+    // Check internet connectivity on remote to decide build strategy
+    const inetCheck = await this.sshExec(sshHost, 'curl -s --connect-timeout 5 -o /dev/null -w "%{http_code}" https://registry.npmjs.org/ 2>/dev/null || echo "no_internet"', { timeoutMs: 10000 });
+    const hasInternet = inetCheck.ok && inetCheck.stdout.trim().startsWith('2');
+    log(`[WF:remoteAddon] internet check: hasInternet=${hasInternet} (response='${inetCheck.stdout.trim()}')`);
 
-    if (_dwf) { log('[WF:remoteAddon] starting remote build via SSH...'); }
     const buildStartTime = Date.now();
-    const buildResult = await vscode.window.withProgress({
-      location: vscode.ProgressLocation.Notification,
-      title: "Building FSDB reader addon on remote (this may take a minute)...",
-      cancellable: false
-    }, () => {
-      const buildScript = `source ~/.profile 2>/dev/null; source ~/.bash_profile 2>/dev/null; cd ${remoteDir} && npm install node-addon-api && cat > binding.gyp << 'VAPORVIEW_EOF'\n${bindingGyp}\nVAPORVIEW_EOF\nnpx node-gyp rebuild`;
-      return this.sshExec(sshHost, '', { stdin: buildScript, timeoutMs: 120000 });
-    });
 
-    const elapsed = ((Date.now() - buildStartTime) / 1000).toFixed(1);
-    if (!buildResult.ok) {
-      log(`[FSDB:SSH] remote build FAILED after ${elapsed}s (exit ${buildResult.code})`);
-      log(`[FSDB:SSH] stdout:\n${buildResult.stdout}`);
-      log(`[FSDB:SSH] stderr:\n${buildResult.stderr}`);
-      vscode.window.showErrorMessage('Failed to build FSDB addon on remote. Check Vaporview output for details.');
+    if (hasInternet) {
+      // — Online path: use npm + node-gyp (original approach) —
+      log('[WF:remoteAddon] internet available — using npm/node-gyp build');
+
+      const bindingGyp = JSON.stringify({
+        variables: { FSDB_READER_LIBS_PATH: fsdbLibsPath, FSDB_HEADER_PATH: headerResult },
+        targets: [{
+          target_name: "fsdb_reader",
+          "cflags!": ["-fno-exceptions"], cflags: ["-fPIC"],
+          "cflags_cc!": ["-fno-exceptions"], cflags_cc: ["-fPIC"],
+          sources: ["src/fsdb_reader.cpp"],
+          include_dirs: [
+            "<!@(node -p \"require('node-addon-api').include\")",
+            "<(FSDB_HEADER_PATH)>"
+          ],
+          defines: ["NAPI_DISABLE_CPP_EXCEPTIONS"],
+          ldflags: ["-L<(FSDB_READER_LIBS_PATH)>", "-static-libstdc++"],
+          libraries: ["-lnffr", "-lnsys"]
+        }]
+      }, null, 2);
+      if (_dwf) { log(`[WF:remoteAddon] binding.gyp:\n${bindingGyp}`); }
+
+      try {
+        await vscode.workspace.fs.writeFile(
+          this.remoteUri(`${remoteDir}/binding.gyp`),
+          Buffer.from(bindingGyp, 'utf-8')
+        );
+        if (_dwf) { log('[WF:remoteAddon] binding.gyp deployed via remote fs'); }
+      } catch (err: any) {
+        log(`[FSDB:SSH] failed to write binding.gyp: ${err.message}`);
+        return false;
+      }
+
+      const buildResult = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: "Building FSDB reader addon on remote (this may take a minute)...",
+        cancellable: false
+      }, async () => {
+        const npmRes = await this.sshExec(sshHost, `cd ${remoteDir} && npm install node-addon-api 2>&1`, { timeoutMs: 120000 });
+        if (!npmRes.ok) { return npmRes; }
+        return this.sshExec(sshHost, `cd ${remoteDir} && npx node-gyp rebuild 2>&1`, { timeoutMs: 120000 });
+      });
+
+      const elapsed = ((Date.now() - buildStartTime) / 1000).toFixed(1);
+      if (!buildResult.ok) {
+        log(`[FSDB:SSH] remote build FAILED after ${elapsed}s (exit ${buildResult.code})`);
+        log(`[FSDB:SSH] build output:\n${buildResult.stdout}`);
+        if (buildResult.stderr.trim()) { log(`[FSDB:SSH] build stderr:\n${buildResult.stderr}`); }
+        vscode.window.showErrorMessage('Failed to build FSDB addon on remote. Check Vaporview output for details.');
+      } else {
+        log(`[FSDB:SSH] remote build SUCCESS after ${elapsed}s`);
+        if (_dwf) { log(`[WF:remoteAddon] build output:\n${buildResult.stdout}`); }
+      }
+      return buildResult.ok;
+
     } else {
-      log(`[FSDB:SSH] remote build SUCCESS after ${elapsed}s`);
-      if (_dwf) { log(`[WF:remoteAddon] build stdout:\n${buildResult.stdout}`); }
+      // — Offline path: compile directly with g++ (no internet required) —
+      log('[WF:remoteAddon] no internet — using direct g++ compilation');
+
+      const napiInclude = `${remoteDir}/node_modules/node-addon-api`;
+      const nodeIncludeCmd = `node -e "console.log(require('path').resolve(process.execPath, '..', '..', 'include', 'node'))"`;
+      const nodeIncResult = await this.sshExec(sshHost, nodeIncludeCmd, { timeoutMs: 10000 });
+      const nodeInclude = nodeIncResult.ok ? nodeIncResult.stdout.trim() : '';
+      if (_dwf) { log(`[WF:remoteAddon] node include path: '${nodeInclude}' (ok=${nodeIncResult.ok})`); }
+
+      if (!nodeInclude) {
+        log(`[FSDB:SSH] could not determine Node.js include path`);
+        vscode.window.showErrorMessage('Could not determine Node.js include path on remote. Ensure Node.js development headers are installed.');
+        return false;
+      }
+
+      const outputDir = `${remoteDir}/build/Release`;
+      const outputFile = `${outputDir}/fsdb_reader.node`;
+      const gppCmd = [
+        `mkdir -p ${outputDir}`,
+        // Source file BEFORE -l flags (gcc processes left-to-right; --as-needed discards libs with no pending refs)
+        `&& g++ -shared -fPIC -DNAPI_DISABLE_CPP_EXCEPTIONS`,
+        `-I"${nodeInclude}"`,
+        `-I"${napiInclude}"`,
+        `-I"${headerResult}"`,
+        `-o "${outputFile}"`,
+        `"${remoteDir}/src/fsdb_reader.cpp"`,
+        `-L"${fsdbLibsPath}"`,
+        `-Wl,-rpath,"${fsdbLibsPath}"`,
+        `-lnffr -lnsys`,
+        `-static-libstdc++`,
+        `2>&1`,
+      ].join(' ');
+      if (_dwf) { log(`[WF:remoteAddon] compile cmd: ${gppCmd}`); }
+
+      log('[WF:remoteAddon] compiling FSDB addon on remote...');
+      const buildResult = await vscode.window.withProgress({
+        location: vscode.ProgressLocation.Notification,
+        title: "Building FSDB reader addon on remote...",
+        cancellable: false
+      }, () => {
+        return this.sshExec(sshHost, gppCmd, { timeoutMs: 120000 });
+      });
+
+      const elapsed = ((Date.now() - buildStartTime) / 1000).toFixed(1);
+      if (!buildResult.ok) {
+        log(`[FSDB:SSH] remote build FAILED after ${elapsed}s (exit ${buildResult.code})`);
+        log(`[FSDB:SSH] build output:\n${buildResult.stdout}`);
+        if (buildResult.stderr.trim()) { log(`[FSDB:SSH] build stderr:\n${buildResult.stderr}`); }
+        vscode.window.showErrorMessage('Failed to build FSDB addon on remote. Check Vaporview output for details.');
+      } else {
+        log(`[FSDB:SSH] remote build SUCCESS after ${elapsed}s`);
+        if (_dwf) { log(`[WF:remoteAddon] build output:\n${buildResult.stdout}`); }
+      }
+      return buildResult.ok;
     }
-    return buildResult.ok;
   }
 
-  private spawnRemoteWorker(sshHost: string, remoteDir: string, fsdbLibsPath: string): ChildProcess {
+  private async spawnRemoteWorker(sshHost: string, remoteDir: string, fsdbLibsPath: string): Promise<ChildProcess> {
     const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
     const ldPath = fsdbLibsPath;
     const workerScript = `${remoteDir}/dist/fsdb_worker.js`;
-    const innerCmd = `cd ${remoteDir} && LD_LIBRARY_PATH=${ldPath}:\\$LD_LIBRARY_PATH NOVAS_FSDB_LOG=0 exec node ${workerScript}`;
-    const sshCmd = `bash --login -c '${innerCmd}'`;
-    if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:spawnRemote] ssh ${sshHost} — ${sshCmd}`); }
+
+    // Write a launcher script to avoid bash --login which can hang on remote profile scripts
+    const launcherScript = [
+      '#!/bin/sh',
+      `cd "${remoteDir}"`,
+      `export LD_LIBRARY_PATH="${ldPath}:$LD_LIBRARY_PATH"`,
+      'export NOVAS_FSDB_LOG=0',
+      `exec node "${workerScript}"`,
+    ].join('\n') + '\n';
+    try {
+      await vscode.workspace.fs.writeFile(
+        this.remoteUri(`${remoteDir}/run_worker.sh`),
+        Buffer.from(launcherScript, 'utf-8')
+      );
+      if (_dwf) { log('[WF:spawnRemote] run_worker.sh deployed via remote fs'); }
+    } catch (err: any) {
+      log(`[FSDB:SSH] failed to write run_worker.sh: ${err.message}`);
+    }
+
+    const sshCmd = `sh ${remoteDir}/run_worker.sh`;
+    if (_dwf) { log(`[WF:spawnRemote] ssh ${sshHost} — ${sshCmd}`); }
     const proc = spawn('ssh', [...this.sshOpts, sshHost, sshCmd], { stdio: ['pipe', 'pipe', 'pipe'] });
-    if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:spawnRemote] spawned pid=${proc.pid}`); }
+    if (_dwf) { log(`[WF:spawnRemote] spawned pid=${proc.pid}`); }
     return proc;
   }
 
@@ -468,10 +634,8 @@ export class FsdbFormatHandler implements WaveformFileParser {
     if (!fsdbReaderLibsPath) {
       if (this.isSSHRemote) {
         if (_dwf) { log('[WF:FsdbHandler.loadNetlist] querying remote env vars for libs path via sshExec...'); }
-        const envResult = await this.sshExec(this.sshHost,
-          `bash --login -c 'if [ -n "$VERDI_HOME" ]; then echo "$VERDI_HOME/share/FsdbReader/linux64"; elif [ -n "$XCELIUM_HOME" ]; then echo "$XCELIUM_HOME/tools.lnx86/lib/64bit"; else echo ""; fi'`,
-          { timeoutMs: 15000 }
-        );
+        const envCmd = 'if [ -n "$VERDI_HOME" ]; then echo "$VERDI_HOME/share/FsdbReader/linux64"; elif [ -n "$XCELIUM_HOME" ]; then echo "$XCELIUM_HOME/tools.lnx86/lib/64bit"; else echo ""; fi';
+        const envResult = await this.sshExec(this.sshHost, envCmd, { timeoutMs: 15000 });
         if (_dwf) { log(`[WF:FsdbHandler.loadNetlist] SSH env query: ok=${envResult.ok} stdout='${envResult.stdout.trim()}' stderr='${envResult.stderr.trim()}'`); }
         if (envResult.ok && envResult.stdout.trim()) {
           fsdbReaderLibsPath = envResult.stdout.trim();
@@ -519,7 +683,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
       this.remoteWorkerDir = remoteDir;
 
       log(`[FSDB] spawning remote worker via SSH on ${this.sshHost}`);
-      this.fsdbWorker = this.spawnRemoteWorker(this.sshHost, remoteDir, fsdbReaderLibsPath);
+      this.fsdbWorker = await this.spawnRemoteWorker(this.sshHost, remoteDir, fsdbReaderLibsPath);
       if (_dwf) { log('[WF:FsdbHandler.loadNetlist] SSH worker spawned, pid=' + this.fsdbWorker.pid); }
     } else {
       // Local Linux path: auto-build addon + fork worker
