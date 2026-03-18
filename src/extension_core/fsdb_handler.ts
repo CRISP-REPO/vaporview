@@ -84,7 +84,26 @@ export class FsdbFormatHandler implements WaveformFileParser {
     return undefined;
   }
 
-  private sshExec(sshHost: string, command: string, opts?: { stdin?: string; timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
+  private async sshExec(sshHost: string, command: string, opts?: { stdin?: string; timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
+    // If SSH auth already failed, go directly to task-based fallback
+    if (this.sshAuthFailed && this.remoteWorkerDir) {
+      return this.remoteTaskExec(command, this.remoteWorkerDir, opts);
+    }
+
+    const result = await this.sshExecDirect(sshHost, command, opts);
+
+    // Detect SSH auth failure and retry via task-based fallback
+    if (result.code === 255 && result.stderr.includes('Permission denied') && this.remoteWorkerDir) {
+      const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+      log('[WF:sshExec] direct SSH auth failed — falling back to VS Code task execution');
+      this.sshAuthFailed = true;
+      return this.remoteTaskExec(command, this.remoteWorkerDir, opts);
+    }
+
+    return result;
+  }
+
+  private sshExecDirect(sshHost: string, command: string, opts?: { stdin?: string; timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
     const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
     const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
     const timeoutMs = opts?.timeoutMs ?? 30000;
@@ -148,6 +167,104 @@ export class FsdbFormatHandler implements WaveformFileParser {
     });
   }
 
+  /** Whether direct SSH has been tested and failed (auth issue) — skip SSH for remaining calls */
+  private sshAuthFailed: boolean = false;
+
+  /**
+   * Execute a command on the remote via VS Code Task API.
+   * Works regardless of SSH auth method since tasks run through VS Code's remote connection.
+   * Captures stdout/stderr/exit code via temp files read back with vscode.workspace.fs.
+   */
+  private async remoteTaskExec(command: string, remoteDir: string, opts?: { stdin?: string; timeoutMs?: number }): Promise<{ ok: boolean; stdout: string; stderr: string; code: number | null }> {
+    const log = (msg: string) => this.providerDelegate.logOutputChannel(msg);
+    const _dwf = process.env.CRISP_DEV_DEBUG_WF === '1';
+    const timeoutMs = opts?.timeoutMs ?? 30000;
+
+    const uid = Date.now().toString(36);
+    const stdoutFile = `${remoteDir}/.cmd-stdout-${uid}`;
+    const stderrFile = `${remoteDir}/.cmd-stderr-${uid}`;
+    const exitFile = `${remoteDir}/.cmd-exit-${uid}`;
+
+    // Ensure remote dir exists (may not yet if this is the first call)
+    try {
+      await vscode.workspace.fs.createDirectory(this.remoteUri(remoteDir));
+    } catch { /* already exists — fine */ }
+
+    // Write a wrapper script that captures output
+    const cmdBody = opts?.stdin ? opts.stdin : command;
+    const script = [
+      '#!/bin/bash',
+      `(${cmdBody}) > "${stdoutFile}" 2> "${stderrFile}"`,
+      `echo $? > "${exitFile}"`,
+    ].join('\n');
+    const scriptFile = `${remoteDir}/.cmd-run-${uid}.sh`;
+
+    try {
+      await vscode.workspace.fs.writeFile(this.remoteUri(scriptFile), Buffer.from(script, 'utf-8'));
+    } catch (err: any) {
+      log(`[WF:remoteTaskExec] failed to write script: ${err.message}`);
+      return { ok: false, stdout: '', stderr: `failed to write script: ${err.message}`, code: null };
+    }
+
+    if (_dwf) { log(`[WF:remoteTaskExec] executing via task: bash ${scriptFile}`); }
+
+    // Execute via VS Code Task API — runs on remote through VS Code's connection
+    const taskDef: vscode.TaskDefinition = { type: 'shell', id: `crisp-fsdb-${uid}` };
+    const task = new vscode.Task(
+      taskDef,
+      vscode.TaskScope.Workspace,
+      `FSDB build ${uid}`,
+      'crisp-fsdb',
+      new vscode.ShellExecution(`bash "${scriptFile}"`)
+    );
+    task.presentationOptions = { reveal: vscode.TaskRevealKind.Silent, echo: false, showReuseMessage: false };
+    task.isBackground = false;
+
+    const completed = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        disposable.dispose();
+        reject(new Error(`task timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+
+      const disposable = vscode.tasks.onDidEndTaskProcess(e => {
+        if (e.execution.task.name === task.name) {
+          clearTimeout(timer);
+          disposable.dispose();
+          resolve();
+        }
+      });
+    });
+
+    try {
+      await vscode.tasks.executeTask(task);
+      await completed;
+    } catch (err: any) {
+      log(`[WF:remoteTaskExec] task execution failed: ${err.message}`);
+      return { ok: false, stdout: '', stderr: `task execution failed: ${err.message}`, code: null };
+    }
+
+    // Read results
+    let stdout = '', stderr = '', exitCode: number | null = null;
+    try {
+      const exitStr = Buffer.from(await vscode.workspace.fs.readFile(this.remoteUri(exitFile))).toString('utf-8').trim();
+      exitCode = parseInt(exitStr, 10);
+    } catch { /* no exit file means something went very wrong */ }
+    try {
+      stdout = Buffer.from(await vscode.workspace.fs.readFile(this.remoteUri(stdoutFile))).toString('utf-8');
+    } catch { /* empty */ }
+    try {
+      stderr = Buffer.from(await vscode.workspace.fs.readFile(this.remoteUri(stderrFile))).toString('utf-8');
+    } catch { /* empty */ }
+
+    // Clean up temp files (fire-and-forget)
+    for (const f of [scriptFile, stdoutFile, stderrFile, exitFile]) {
+      vscode.workspace.fs.delete(this.remoteUri(f)).then(() => {}, () => {});
+    }
+
+    if (_dwf) { log(`[WF:remoteTaskExec] done: code=${exitCode} stdout=${stdout.length}b stderr=${stderr.length}b`); }
+    return { ok: exitCode === 0, stdout, stderr, code: exitCode };
+  }
+
   private remoteUri(remotePath: string): vscode.Uri {
     return vscode.Uri.parse(`vscode-remote://ssh-remote+${this.sshHost}${remotePath}`);
   }
@@ -177,10 +294,14 @@ export class FsdbFormatHandler implements WaveformFileParser {
     const cppContent = hasCpp ? fs.readFileSync(localCppPath, 'utf-8') : '';
 
     // Locate node-addon-api headers bundled with the extension
-    const napiDir = path.resolve(__dirname, '..', 'node_modules', 'node-addon-api');
+    // Try node_modules first, then dist/napi/ (copied by esbuild plugin)
+    let napiDir = path.resolve(__dirname, '..', 'node_modules', 'node-addon-api');
+    if (!fs.existsSync(path.join(napiDir, 'napi.h'))) {
+      napiDir = path.resolve(__dirname, 'napi');
+    }
     const napiHeaders = ['napi.h', 'napi-inl.h', 'napi-inl.deprecated.h'];
     const napiIndex = path.join(napiDir, 'index.js');
-    const hasNapi = fs.existsSync(napiIndex);
+    const hasNapi = fs.existsSync(path.join(napiDir, 'napi.h'));
     if (_dwf) { log(`[WF:deployRemote] napiDir=${napiDir} exists=${hasNapi}`); }
 
     log(`[FSDB:SSH] deploying to ${sshHost}:${remoteDir} via VS Code remote filesystem`);
@@ -228,6 +349,17 @@ export class FsdbFormatHandler implements WaveformFileParser {
             await vscode.workspace.fs.writeFile(
               this.remoteUri(`${remoteDir}/node_modules/node-addon-api/${f}`),
               fs.readFileSync(fPath)
+            );
+          }
+        }
+        // Deploy Node.js N-API core headers (bundled in dist/napi/ at build time)
+        const nodeApiHeaders = ['node_api.h', 'node_api_types.h', 'js_native_api.h', 'js_native_api_types.h'];
+        for (const hdr of nodeApiHeaders) {
+          const hdrPath = path.join(napiDir, hdr);
+          if (fs.existsSync(hdrPath)) {
+            await vscode.workspace.fs.writeFile(
+              this.remoteUri(`${remoteDir}/node_modules/node-addon-api/${hdr}`),
+              fs.readFileSync(hdrPath)
             );
           }
         }
@@ -395,21 +527,29 @@ export class FsdbFormatHandler implements WaveformFileParser {
       const nodeInclude = nodeIncResult.ok ? nodeIncResult.stdout.trim() : '';
       if (_dwf) { log(`[WF:remoteAddon] node include path: '${nodeInclude}' (ok=${nodeIncResult.ok})`); }
 
-      if (!nodeInclude) {
-        log(`[FSDB:SSH] could not determine Node.js include path`);
-        vscode.window.showErrorMessage('Could not determine Node.js include path on remote. Ensure Node.js development headers are installed.');
-        return false;
+      // Verify node include path has headers; if not, we rely on bundled N-API headers in napiInclude
+      let nodeIncludeValid = false;
+      if (nodeInclude) {
+        const checkResult = await this.sshExec(sshHost, `test -f "${nodeInclude}/node_api.h" && echo ok`, { timeoutMs: 5000 });
+        nodeIncludeValid = checkResult.ok && checkResult.stdout.trim() === 'ok';
+        if (_dwf) { log(`[WF:remoteAddon] node include has headers: ${nodeIncludeValid}`); }
+        if (!nodeIncludeValid) {
+          log(`[WF:remoteAddon] node headers not found at ${nodeInclude} — using bundled N-API headers`);
+        }
       }
 
       const outputDir = `${remoteDir}/build/Release`;
       const outputFile = `${outputDir}/fsdb_reader.node`;
+      const includePaths = [
+        ...(nodeIncludeValid ? [`-I"${nodeInclude}"`] : []),
+        `-I"${napiInclude}"`,
+        `-I"${headerResult}"`,
+      ];
       const gppCmd = [
         `mkdir -p ${outputDir}`,
         // Source file BEFORE -l flags (gcc processes left-to-right; --as-needed discards libs with no pending refs)
-        `&& g++ -shared -fPIC -DNAPI_DISABLE_CPP_EXCEPTIONS`,
-        `-I"${nodeInclude}"`,
-        `-I"${napiInclude}"`,
-        `-I"${headerResult}"`,
+        `&& g++ -shared -fPIC -std=c++17 -DNAPI_DISABLE_CPP_EXCEPTIONS`,
+        ...includePaths,
         `-o "${outputFile}"`,
         `"${remoteDir}/src/fsdb_reader.cpp"`,
         `-L"${fsdbLibsPath}"`,
@@ -625,6 +765,9 @@ export class FsdbFormatHandler implements WaveformFileParser {
     if (sshInfo) {
       this.sshHost = sshInfo.sshHost;
       log(`[FSDB] SSH remote mode: host=${this.sshHost}`);
+      // Set remoteWorkerDir early so sshExec fallback can use it
+      const wsFolder = vscode.workspace.workspaceFolders?.[0];
+      this.remoteWorkerDir = `${wsFolder ? wsFolder.uri.path : '/tmp'}/.crisp-fsdb`;
     }
 
     // Resolve FSDB libs path

@@ -1,4 +1,6 @@
 const esbuild = require('esbuild');
+const fs = require('fs');
+const path = require('path');
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -23,6 +25,54 @@ const esbuildProblemMatcherPlugin = {
   }
 };
 
+/**
+ * Copies node-addon-api headers AND Node.js N-API headers into dist/napi/
+ * so they ship with the extension. Needed for offline remote FSDB addon compilation.
+ */
+const copyNapiPlugin = {
+  name: 'copy-napi-headers',
+  setup(build) {
+    build.onEnd(() => {
+      const napiDst = path.resolve(__dirname, 'dist', 'napi');
+      fs.mkdirSync(napiDst, { recursive: true });
+
+      // 1) node-addon-api headers (C++ wrapper)
+      const napiSrc = path.resolve(__dirname, 'node_modules', 'node-addon-api');
+      const napiFiles = ['napi.h', 'napi-inl.h', 'napi-inl.deprecated.h', 'index.js', 'package.json'];
+      if (!fs.existsSync(path.join(napiSrc, 'napi.h'))) {
+        console.warn('[copy-napi-headers] node-addon-api not found, skipping');
+        return;
+      }
+      for (const f of napiFiles) {
+        const src = path.join(napiSrc, f);
+        if (fs.existsSync(src)) {
+          fs.copyFileSync(src, path.join(napiDst, f));
+        }
+      }
+
+      // 2) Node.js N-API core headers (platform-independent C headers)
+      const { execSync } = require('child_process');
+      let nodeIncDir = '';
+      try {
+        nodeIncDir = execSync('node -e "console.log(require(\'path\').resolve(process.execPath, \'..\', \'..\', \'include\', \'node\'))"', { encoding: 'utf-8' }).trim();
+      } catch { /* ignore */ }
+      const nodeHeaders = ['node_api.h', 'node_api_types.h', 'js_native_api.h', 'js_native_api_types.h'];
+      if (nodeIncDir && fs.existsSync(path.join(nodeIncDir, 'node_api.h'))) {
+        for (const h of nodeHeaders) {
+          const src = path.join(nodeIncDir, h);
+          if (fs.existsSync(src)) {
+            fs.copyFileSync(src, path.join(napiDst, h));
+          }
+        }
+        console.log('[copy-napi-headers] copied napi + node N-API headers to dist/napi/');
+      } else {
+        console.warn('[copy-napi-headers] Node.js N-API headers not found at ' + nodeIncDir);
+        console.log('[copy-napi-headers] copied napi headers (without node N-API) to dist/napi/');
+      }
+    });
+  }
+};
+
 const commonConfig = {
   bundle: true,
   minify: production,
@@ -37,7 +87,7 @@ const extensionConfig = {
   platform: 'node',
   outfile: 'dist/extension.js',
   external: ['vscode'], // Only external we actually need
-  plugins: [esbuildProblemMatcherPlugin],
+  plugins: [esbuildProblemMatcherPlugin, copyNapiPlugin],
 };
 
 const workerConfig = {
