@@ -1,9 +1,10 @@
 import type { NetlistId, SignalId } from '../common/types';
+import type { FsdbWaveformData, FsdbWorkerIpcMessage } from './fsdb_types';
 
 // Detect IPC mode (fork) vs stdio mode (SSH spawn)
 const hasIPC = typeof process.send === 'function';
 
-function sendMsg(msg: any): void {
+function sendMsg(msg: unknown): void {
     if (hasIPC) {
         process.send!(msg);
     } else {
@@ -11,7 +12,21 @@ function sendMsg(msg: any): void {
     }
 }
 
-let fsdbAddon: any = null;
+interface FsdbAddon {
+    openFsdb(fsdbPath: string): void;
+    readScopes(scopeCallback: (name: string, type: string, path: string, netlistId: number, scopeOffsetIdx: number) => void, upscopeCallback: () => void): void;
+    readMetadata(setMetadataFn: (...args: Parameters<typeof setMetadata>) => void, setChunkSizeFn: (chunksize: number, timeend: number) => void): void;
+    readVars(scopePath: string, scopeOffsetIdx: number, varCallback: (...args: Parameters<typeof fsdbVarCallback>) => void, arrayBeginCallback: (name: string, path: string, netlistId: number) => void, arrayEndCallback: (size: number) => void): void;
+    loadSignals(signalIdList: number[]): void;
+    getValueChanges(signalId: number): FsdbWaveformData;
+    getValuesAtTime(signalId: number, time: number): string | string[];
+    unloadSignal(signalId: number): void;
+    setViewWindow(startTime: number, endTime: number): void;
+    getVarInfo(signalId: number): string | string[];
+    unload(): void;
+}
+
+let fsdbAddon: FsdbAddon | null = null;
 try {
     fsdbAddon = require('../build/Release/fsdb_reader.node');
     // fsdbAddon = require('../build/Debug/fsdb_reader.node');
@@ -19,13 +34,13 @@ try {
     // 1. Build the addon with debug symbols: `node-gyp rebuild --debug`
     // 2. Run the extension and find PID for fsdb_worker.js: `ps aux | grep fsdb_worker`
     // 3. Attach gdb to the worker process: `gdb -p <PID>`
-} catch (error) {
+} catch (error: unknown) {
     sendMsg({ command: 'require-failed', error: error });
 }
 
 console.error("Start FSDB worker" + (hasIPC ? " (IPC)" : " (stdio)"));
 
-function messageHandler(message: any) {
+function messageHandler(message: FsdbWorkerIpcMessage) {
     const result = handleMessage(message);
     sendMsg({ id: message.id, result: result });
 }
@@ -45,8 +60,8 @@ if (hasIPC) {
             if (line.trim()) {
                 try {
                     messageHandler(JSON.parse(line));
-                } catch (e: any) {
-                    console.error('FSDB worker: failed to parse stdin message:', e.message);
+                } catch (e) {
+                    console.error('FSDB worker: failed to parse stdin message:', (e as Error).message);
                 }
             }
         }
@@ -54,7 +69,8 @@ if (hasIPC) {
     process.stdin.resume();
 }
 
-function handleMessage(message: any) {
+function handleMessage(message: FsdbWorkerIpcMessage): FsdbWaveformData | string | string[] | undefined {
+    if (!fsdbAddon) { return undefined; }
     switch (message.command) {
         case 'openFsdb': { fsdbAddon.openFsdb(message.fsdbPath); break; }
         case 'readScopes': { fsdbAddon.readScopes(fsdbScopeCallback, fsdbUpscopeCallback); break; }
@@ -71,6 +87,7 @@ function handleMessage(message: any) {
         case 'getVarInfo': { return fsdbAddon.getVarInfo(message.signalId); }
         case 'unload': { fsdbAddon.unload(); break; }
     }
+    return undefined;
 }
 
 function fsdbScopeCallback(name: string, type: string, path: string, netlistId: number, scopeOffsetIdx: number) {

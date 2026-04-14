@@ -1,15 +1,18 @@
 import { createInstancePath } from "../common/functions";
-import { QueueEntry, WindowMessageType, StateChangeType, NetlistId, RowId } from "../common/types";
+import { QueueEntry, WindowMessageType, StateChangeType, NetlistId, RowId, ConfigSettingsMessage, ExternalKeyDownMessage } from "../common/types";
+import { ActionType, type EventHandler } from './event_handler';
 import { SignalGroup, NetlistVariable, CustomVariable } from "./signal_item";
-import { viewerState, events, createWebviewContext, viewport, rowHandler, getParentGroupIdList, labelsPanel, EventHandler, ActionType, dataManager, controlBar, styles, unload, init, revealSignal, config } from "./vaporview";
+import { viewerState, events, createWebviewContext, viewport, rowHandler, getParentGroupIdList, labelsPanel, dataManager, controlBar, styles, unload, init, revealSignal, config } from "./vaporview";
 import { copyWaveDrom } from "./wavedrom";
+
+import { differenceCiede2000, rgb } from "culori";
 
 declare function acquireVsCodeApi(): VsCodeApi;
 const vscode = acquireVsCodeApi();
 interface VsCodeApi {
-  postMessage(message: any): void;
-  setState(newState: any): void;
-  getState(): any;
+  postMessage(message: unknown): void;
+  setState(newState: unknown): void;
+  getState(): unknown;
 }
 
 export enum OS {
@@ -19,11 +22,6 @@ export enum OS {
   Unknown
 }
 
-// This object tracks extension settings that pertain to the webview
-// Settings are registered in the following places:
-// - package.json in contributes.configuration
-// - extension_core/document.ts - setConfigurationSettings()
-// - here - setConfigSettings()
 export class Configuration {
   touchpadScrolling: boolean        = false;
   autoTouchpadScrolling: boolean    = false;
@@ -35,13 +33,21 @@ export class Configuration {
   overrideDevicePixelRatio: boolean = false;
   userPixelRatio: number            = 1;
   disableAnalogRendererOptimizations: boolean = false;
+
+  defaultSingleBitColor: number     = 0;
+  defaultMultiBitColor: number      = 0;
+  defaultParamColor: number         = 0;
+  defaultStringColor: number        = 0;
+  defaultEnumColor: number          = 0;
+  defaultCustomSignalColor: number  = 0;
+
   os: OS                            = OS.Unknown;
 
   constructor() {
     this.os = this.getOS();
   }
 
-  setConfigSettings(settings: any) {
+  setConfigSettings(settings: ConfigSettingsMessage) {
     if (settings.scrollingMode !== undefined) {
       controlBar.setScrollMode(settings.scrollingMode);
     }
@@ -75,9 +81,24 @@ export class Configuration {
       this.animationDuration = settings.animationDuration;
     }
 
-    // Custom Colors
-    if (settings.customColors !== undefined) {
-      styles.customColorKey = settings.customColors;
+    // Default Colors
+    if (settings.defaultSingleBitColor !== undefined) {
+      this.defaultSingleBitColor = Math.floor(settings.defaultSingleBitColor - 1);
+    }
+    if (settings.defaultMultiBitColor !== undefined) {
+      this.defaultMultiBitColor = Math.floor(settings.defaultMultiBitColor - 1);
+    }
+    if (settings.defaultParamColor !== undefined) {
+      this.defaultParamColor = Math.floor(settings.defaultParamColor - 1);
+    }
+    if (settings.defaultStringColor !== undefined) {
+      this.defaultStringColor = Math.floor(settings.defaultStringColor - 1);
+    }
+    if (settings.defaultEnumColor !== undefined) {
+      this.defaultEnumColor = Math.floor(settings.defaultEnumColor - 1);
+    }
+    if (settings.defaultCustomSignalColor !== undefined) {
+      this.defaultCustomSignalColor = Math.floor(settings.defaultCustomSignalColor - 1);
     }
 
     // Pixel Ratio
@@ -107,10 +128,18 @@ export class Configuration {
   }
 }
 
+interface ColorProfile {
+  index: number;
+  color: string;
+  rgbColor: ReturnType<typeof rgb>;
+  deltaBackground: number | undefined;
+  deltaXZ: number | undefined;
+  tier: number;
+}
+
 export class ThemeColors {
 
   colorKey: string[] = ['#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC'];
-  customColorKey: string[] = ['#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC'];
   xzColor: string = 'red';
   textColor: string = 'white';
   rulerTextColor: string = 'grey';
@@ -150,7 +179,8 @@ export class ThemeColors {
     //this.colorKey[3] = style.getPropertyValue('--vscode-debugTokenExpression-name');
 
     // Non-2-State Signal Color
-    //this.xzColor = style.getPropertyValue('--vscode-debugTokenExpression-error');
+    this.xzColor = style.getPropertyValue('--vscode-debugTokenExpression-error');
+    //this.xzColor = style.getPropertyValue('--vscode-list-errorForeground');
 
     // Text Color
     this.textColor = style.getPropertyValue('--vscode-editor-foreground');
@@ -206,17 +236,151 @@ export class ThemeColors {
     this.rulerHeight = parseInt(style.getPropertyValue('--ruler-height'));
   }
 
-  updateColorPalette(colorPalette: string[], errorColorPalette: string[]) {
+  // We're not done selecting a color palette here! We need to filter out
+  // colors that are too close to the background color or the non-2-state color
+  // Step 5: Compare the colors in the palette to the background color and the
+  //         non-2-state color, and bin them based on how close they are
+  // Step 6: Select from all of our top tier colors, and if we don't have
+  //         enough colors, then select from the next tier, etc.
+  updateColorPalette(colorPalette: string[], errorColorPalette: string[], themeValid: boolean) {
 
-    this.colorKey  = colorPalette;
-    if (errorColorPalette.length > 0) {
-      this.xzColor = errorColorPalette[0];
-    } else {
-      const style  = window.getComputedStyle(document.body);
-      this.xzColor = style.getPropertyValue('--vscode-debugTokenExpression-error');
+    const style = window.getComputedStyle(document.body);
+    this.backgroundColor = style.getPropertyValue('--vscode-editor-background');
+    this.xzColor = style.getPropertyValue('--vscode-debugTokenExpression-error');
+
+    if (!themeValid) {
+      //console.log("Using default color palette because theme is not valid");
+      this.colorKey = ['#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC'];
+      this.colorKey[0] = style.getPropertyValue('--vscode-debugTokenExpression-number');
+      this.colorKey[1] = style.getPropertyValue('--vscode-debugTokenExpression-string');
+      this.colorKey[2] = style.getPropertyValue('--vscode-debugTokenExpression-type');
+      this.colorKey[3] = style.getPropertyValue('--vscode-debugTokenExpression-name');
+      this.events.updateColorTheme();
+      return;
     }
 
-    this.events.dispatch(ActionType.UpdateColorTheme)
+    if (this.backgroundColor === undefined) {return;}
+    if (this.xzColor === undefined) {return;}
+    const rgbBackground = rgb(this.backgroundColor);
+    const rgbXZ = rgb(this.xzColor);
+    if (rgbBackground === undefined) {return;}
+    if (rgbXZ === undefined) {return;}
+
+    //console.log(`--- Background color: ${this.backgroundColor} rgb(${rgbBackground.r}, ${rgbBackground.g}, ${rgbBackground.b})`);
+    //console.log(`--- XZ color: ${this.xzColor} rgb(${rgbXZ.r}, ${rgbXZ.g}, ${rgbXZ.b})`);
+
+    const deltaE = differenceCiede2000();
+    let colorIndex = 1;
+
+    const topTierColors: number[] = [];
+    const midTierColors: number[] = [];
+    const lowTierColors: number[] = [];
+    const bottomTierColors: number[] = [];
+
+    const colorProfiles: ColorProfile[] = [];
+
+    // Arrange colors into tiers based on their distance from the background color
+    // And similarity to the XZ color
+    const colorList = colorPalette.concat(errorColorPalette);
+    colorList.forEach((color, index) => {
+      //if (topTierColors.length >= 8) {return;}
+      const rgbColor = rgb(color);
+      if (rgbColor === undefined) {
+        colorProfiles.push({
+          index: index,
+          color: color,
+          rgbColor: undefined,
+          deltaBackground: undefined,
+          deltaXZ: undefined,
+          tier: 5,
+        });
+        return;
+      }
+
+      // round to 2 decimal places for logging
+      const deltaBackground = Math.round(deltaE(rgbBackground, rgbColor) * 100) / 100;
+      const deltaXZ         = Math.round(deltaE(rgbColor, rgbXZ) * 100) / 100;
+
+      let tier = 0;
+      if (deltaBackground >= 35 && deltaXZ >= 15) {
+        topTierColors.push(index);
+        tier = 1;
+      } else if (deltaBackground >= 30 && deltaXZ >= 15) {
+        midTierColors.push(index);
+        tier = 2;
+      } else if (deltaBackground >= 25 && deltaXZ >= 10) {
+        lowTierColors.push(index);
+        tier = 3;
+      } else if (deltaBackground >= 15) {
+        bottomTierColors.push(index);
+        tier = 4;
+      }
+
+      colorProfiles.push({
+        index: index,
+        color: color,
+        rgbColor: rgbColor,
+        deltaBackground: deltaBackground,
+        deltaXZ: deltaXZ,
+        tier: tier,
+      });
+
+      //console.log(`Color ${colorIndex} ${color} has deltaE of ${deltaBackground} from background color and deltaE of ${deltaXZ} from XZ color - tier: ${tier}`);
+      colorIndex++;
+    });
+
+    const contrastSortedColors = topTierColors.concat(midTierColors).concat(lowTierColors).concat(bottomTierColors);
+    const finalColorPalette: number[] = [];
+    const secondaryColorPalette: number[] = [];
+    const tertiaryColorPalette: number[] = [];
+
+    // Next, we check to see how similar they are to each other, and bump them in to lower tiers if
+    // they're too similar to other colors in the color palette
+    contrastSortedColors.forEach(index => {
+      if (finalColorPalette.length >= 8) {return;}
+      const testColorProfile = colorProfiles[index];
+      if (!testColorProfile) {return;}
+      const testRgbColor = testColorProfile.rgbColor;
+      if (testRgbColor === undefined) {return;}
+
+      let minDelta = Infinity;
+      finalColorPalette.forEach(index => {
+        const paletteColorProfile = colorProfiles[index];
+        if (!paletteColorProfile) {return;}
+        const paletteRgbColor = paletteColorProfile.rgbColor;
+        if (paletteRgbColor === undefined) {return;}
+        const delta = Math.round(deltaE(testRgbColor, paletteRgbColor) * 100) / 100;
+        minDelta = Math.min(minDelta, delta);
+      });
+
+      //console.log(`Color ${testColorProfile.color} has minimum deltaE of ${minDelta} from colors in final palette`);
+
+      if (minDelta >= 8) {
+        finalColorPalette.push(index);
+      } else if (minDelta >= 5) {
+        secondaryColorPalette.push(index);
+      } else {
+        tertiaryColorPalette.push(index);
+      }
+    });
+
+    // Lastly, we want to make sure that something kind of far from red is color 1
+    const similaritySortedColors = finalColorPalette.concat(secondaryColorPalette).concat(tertiaryColorPalette);
+
+    const color1Index   = similaritySortedColors[0];
+    const color1Profile = colorProfiles[color1Index];
+    const color1DeltaXZ = Math.min(color1Profile.deltaXZ ?? 0, 35);
+    const color2Index   = similaritySortedColors[1];
+    const color2Profile = colorProfiles[color2Index];
+    const color2DeltaXZ = Math.min(color2Profile.deltaXZ ?? 0, 35);
+    if (color1DeltaXZ < color2DeltaXZ) {
+      // Swap color1 and color2
+      similaritySortedColors[0] = color2Index;
+      similaritySortedColors[1] = color1Index;
+    }
+
+    this.colorKey = similaritySortedColors.map(index => colorProfiles[index].color);
+    this.events.updateColorTheme();
   }
 }
 
@@ -236,7 +400,7 @@ export class VscodeWrapper {
     vscode.postMessage({command: 'ready'});
   }
 
-  handleMessage(e: any) {
+  handleMessage(e: MessageEvent) {
     const message = e.data;
 
     switch (message.command) {
@@ -268,16 +432,16 @@ export class VscodeWrapper {
       case 'setSelectedSignal':     {this.setSelectedSignal(message.netlistId); break;}
       case 'copyWaveDrom':          {copyWaveDrom(); break;}
       case 'copyValueAtMarker':     {labelsPanel.copyValueAtMarker(message.rowId); break;}
-      case 'updateColorPalette':    {styles.updateColorPalette(message.colorPalette, message.errorColorPalette); break;}
+      case 'updateColorPalette':    {styles.updateColorPalette(message.colorPalette, message.errorColorPalette, message.themeValid); break;}
       default:                      {this.outputLog('Unknown webview message type: ' + message.command); break;}
     }
   }
 
-  externalKeyDownHandler(e: any) {
+  externalKeyDownHandler(e: ExternalKeyDownMessage) {
     switch (e.keyCommand) {
       case 'nextEdge': {controlBar.goToNextTransition(1, []); break;}
-      case 'previousEdge': {controlBar.goToNextTransition(-1, []); break}
-      case 'zoomToFit': {viewport.animateZoomRange(0, viewport.timeStop); break}
+      case 'previousEdge': {controlBar.goToNextTransition(-1, []); break;}
+      case 'zoomToFit': {viewport.animateZoomRange(0, viewport.timeStop); break;}
       case 'increaseVerticalScale': {this.handleUpdateVerticalScale(e.event, 2); break;}
       case 'decreaseVerticalScale': {this.handleUpdateVerticalScale(e.event, 0.5); break;}
       case 'resetVerticalScale':    {this.handleUpdateVerticalScale(e.event, 0); break;}
@@ -288,18 +452,18 @@ export class VscodeWrapper {
     if (netlistId === undefined) {return;}
     const rowIdList = rowHandler.getRowIdsFromNetlistId(netlistId);
     if (rowIdList.length === 0) {return;}
-    this.events.dispatch(ActionType.SignalSelect, rowIdList, rowIdList[0]);
+    this.events.signalSelect(rowIdList, rowIdList[0]);
     //console.log('handleSetSelectedSignal');
     this.sendWebviewContext(StateChangeType.User);
   }
 
   setMarker(time: number, markerType: number) {
     //console.log('handleMessage - setMarker');
-    this.events.dispatch(ActionType.MarkerSet, time, markerType);
+    this.events.markerSet(time, markerType);
     this.sendWebviewContext(StateChangeType.User);
   }
 
-  handleUpdateVerticalScale(event: any, scale: number) {
+  handleUpdateVerticalScale(event: { rowId?: RowId } | null | undefined, scale: number) {
     let rowIdList: RowId[] = viewerState.selectedSignal;
     if (event && event.rowId !== undefined && !viewerState.selectedSignal.includes(event.rowId)) {
       rowIdList = [event.rowId];
@@ -312,18 +476,20 @@ export class VscodeWrapper {
       const renderType = netlistData.renderType.id;
       if (renderType === "multiBit" || renderType === "binary") {return;}
       netlistData.verticalScale = Math.max(1, netlistData.verticalScale * scale);
-      this.events.dispatch(ActionType.RedrawVariable, rowId);
+      this.events.redrawVariable(rowId);
     }); 
   }
 
   handleRemoveVariable(rowIdList: RowId[], recursive: boolean) {
     const instancePathList: string[] = [];
-    const netlistIdList: number[] = []
+    const netlistIdList: number[] = [];
     rowIdList.forEach(rowId => {
       const signalItem = rowHandler.rowItems[rowId];
       if (!(signalItem instanceof NetlistVariable)) {return;}
       const instancePath = createInstancePath(signalItem.scopePath, signalItem.signalName);
-      netlistIdList.push(signalItem.netlistId);
+      if (signalItem.netlistId !== undefined) {
+        netlistIdList.push(signalItem.netlistId);
+      }
       instancePathList.push(instancePath);
     });
 
@@ -343,8 +509,10 @@ export class VscodeWrapper {
       const netlistData = rowHandler.rowItems[rowId];
       if (netlistData === undefined) {return;}
       if (!(netlistData instanceof NetlistVariable)) {return;}
-      netlistIdList.push(netlistData.netlistId);
-      let instancePath = createInstancePath(netlistData.scopePath, netlistData.signalName);
+      if (netlistData.netlistId !== undefined) {
+        netlistIdList.push(netlistData.netlistId);
+      }
+      const instancePath = createInstancePath(netlistData.scopePath, netlistData.signalName);
       instancePathList.push(instancePath);
     });
 
@@ -355,7 +523,7 @@ export class VscodeWrapper {
 
   sendWebviewContext(stateChangeType: number) {
     if (events.isBatchMode) {return;}
-    const context: any = createWebviewContext();
+    const context = createWebviewContext() as Record<string, unknown>;
     context.stateChangeType = stateChangeType;
     vscode.setState(context);
     context.command = 'contextUpdate';
@@ -371,7 +539,7 @@ export class VscodeWrapper {
     });
   }
 
-  executeCommand(command: string, args: any[]) {
+  executeCommand(command: string, args: unknown[]) {
     vscode.postMessage({
       command: 'executeCommand',
       commandName: command,
@@ -379,7 +547,7 @@ export class VscodeWrapper {
     });
   }
 
-  updateConfiguration(property: string, value: any) {
+  updateConfiguration(property: string, value: unknown) {
     vscode.postMessage({
       command: 'updateConfiguration',
       property: property,
@@ -454,7 +622,7 @@ export class VscodeWrapper {
     const data    = e.dataTransfer.getData('codeeditors');
     if (!data) {return;}
     const dataObj = JSON.parse(data);
-    const uriList = dataObj.map((d: any) => {return d.resource;});
+    const uriList = dataObj.map((d: { resource: string }) => {return d.resource;});
 
     const {newGroupId, newIndex} = labelsPanel.dragEndExternal(e, false);
 

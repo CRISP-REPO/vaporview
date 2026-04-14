@@ -7,8 +7,9 @@
 // 2. Define a new command in the package.json file (which has examples)
 // under contributes.commands and create the context menus entries under 
 // contributes.menus.vaporview.valueFormat.
-// 3. Register the new command in the extension.ts (which has examples)
+// 3. Register the new command in the commands.ts (which has examples)
 
+import { Temporal } from '@js-temporal/polyfill';
 import { WindowMessageType } from "../common/types";
 import { htmlSafe, type NetlistVariable, type CustomVariable } from "./signal_item";
 import { dataManager, vscodeWrapper } from "./vaporview";
@@ -457,6 +458,37 @@ export const formatAscii: ValueFormat = {
   checkWidth: (width: number) => {return width > 1;},
 };
 
+//region Format epoch time nanoseconds
+export const formatEpochTime: ValueFormat = {
+  id: "nsepoch",
+  rightJustify: false,
+  symbolText: "time",
+
+  formatString: (binaryString: string, width: number, is2State: boolean) => {
+    if (!is2State) {return formatBinaryString(binaryString);}
+    const intValue = BigInt('0b' + binaryString);
+    const instant  = Temporal.Instant.fromEpochNanoseconds(intValue);
+    const dateTime = instant.toZonedDateTimeISO('UTC');
+    const year     = dateTime.year.toString().padStart(4, '0');
+    const month    = dateTime.month.toString().padStart(2, '0');
+    const day      = dateTime.day.toString().padStart(2, '0');
+    const hour     = dateTime.hour.toString().padStart(2, '0');
+    const minute   = dateTime.minute.toString().padStart(2, '0');
+    const second   = dateTime.second.toString().padStart(2, '0');
+    const ms       = dateTime.millisecond.toString().padStart(3, '0');
+    const mus      = dateTime.microsecond.toString().padStart(3, '0');
+    const ns       = dateTime.nanosecond.toString().padStart(3, '0');
+
+    return `${year}-${month}-${day} ${hour}:${minute}:${second}.${ms},${mus},${ns}`;
+  },
+
+  checkValidSearch: (searchString: string) => {return true;},
+  parseSearchValue: (searchString: string) => {return searchString;},
+  checkSearchValue: regexMatchString,
+  is9State: valueIs9State,
+  checkWidth: (width: number) => {return width >= 64;},
+};
+
 // #region Format String
 export const formatString: ValueFormat = {
   id: "string",
@@ -487,13 +519,13 @@ export class EnumValueFormat implements ValueFormat {
     const result = enumTable.find((entry) => {return entry[0] === inputString;});
     if (result) {return htmlSafe(result[1]);}
     return htmlSafe(inputString);
-  }
+  };
 
-  public checkValidSearch = (searchString: string) => {return dataManager.enumTable[this.enumType].find((entry) => {return entry[0] === searchString;}) !== undefined;}
-  public parseSearchValue = (searchString: string) => {return searchString;}
+  public checkValidSearch = (searchString: string) => {return dataManager.enumTable[this.enumType].find((entry) => {return entry[0] === searchString;}) !== undefined;};
+  public parseSearchValue = (searchString: string) => {return searchString;};
   public checkSearchValue = regexMatchBinary;
-  public is9State = () => {return false;}
-  public checkWidth = (width: number) => {return true;}
+  public is9State = () => {return false;};
+  public checkWidth = (width: number) => {return true;};
 }
 
 // #region Format Fixed Point
@@ -530,7 +562,7 @@ export class FixedPointValueFormat implements ValueFormat {
     }
 
     return (value * this.multiplier).toString();
-  }
+  };
 
   public checkValidSearch(searchString: string) {
     if (searchString.match(/^-?[0-9xzXZ_,]+(\.\d+)?$/)) {return true;}
@@ -540,7 +572,7 @@ export class FixedPointValueFormat implements ValueFormat {
   public parseSearchValue(searchString: string) {return searchString.replace(/[,_]/g, '');}
   public checkSearchValue = regexMatchString;
   public is9State = valueIs9State;
-  public checkWidth = (width: number) => {return width > 1;}
+  public checkWidth = (width: number) => {return width > 1;};
 }
 
 export const valueFormatList: ValueFormat[] = [
@@ -556,12 +588,15 @@ export const valueFormatList: ValueFormat[] = [
   formatBFloat16,
   formatTensorFloat32,
   formatAscii,
+  formatEpochTime,
   formatString
 ];
 
 export function getNumberFormatById(netlistData: NetlistVariable | CustomVariable, numberFormatId: string): ValueFormat {
   const valueFormat = valueFormatList.find((format) => format.id === numberFormatId);
   if (valueFormat !== undefined) {return valueFormat;}
+
+  // special handling for enum and fixed point
   if (numberFormatId === "enum") {
     const enumType = netlistData.enumType;
     if (enumType !== undefined && enumType !== "") {

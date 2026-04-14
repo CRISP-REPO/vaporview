@@ -1,8 +1,10 @@
 import * as vscode from 'vscode';
 import { NetlistId, SignalId, VariableEncoding } from '../common/types';
+import type { WebviewStateEvent } from './document';
 import { bitRangeString, createInstancePath, parseParamValue } from '../common/functions';
 import type { VaporviewDocument } from './document';
 import { WaveformViewerProvider } from './viewer_provider';
+import type { NetlistTreeItemData } from '../../packages/vaporview-api/types';
 
 // Scopes
 const scopeColor    = new vscode.ThemeColor('charts.purple');
@@ -17,6 +19,7 @@ const classIcon     = new vscode.ThemeIcon('symbol-misc',      scopeColor);
 const interfaceIcon = new vscode.ThemeIcon('debug-disconnect', scopeColor);
 const packageIcon   = new vscode.ThemeIcon('package',          scopeColor);
 const scopeIcon     = new vscode.ThemeIcon('symbol-module',    scopeColor);
+const unknownIcon   = new vscode.ThemeIcon('symbol-misc',      scopeColor);
 
 export function getScopeIcon(type: string) {
   const typeName = type.toLocaleLowerCase();
@@ -45,8 +48,11 @@ export function getScopeIcon(type: string) {
     case 'vhdlpackage':      {return packageIcon;}
     case 'ghwgeneric':       {return scopeIcon;}
     case 'vhdlarray':        {return scopeIcon;}
+    case 'unknown':          {return unknownIcon;}
+    case 'clocking':         {return scopeIcon;}
+    case 'svarray':          {return scopeIcon;}
   }
-  return scopeIcon;
+  return unknownIcon;
 }
 
 export function createScope(
@@ -113,6 +119,7 @@ export function getVarIcon(type: string) {
     case 'port':            {return portIcon;}
     case 'sparsearray':     {return defaultIcon;}
     case 'realtime':        {return timeIcon;}
+    case 'realparameter':   {return paramIcon;}
     case 'bit':             {return defaultIcon;}
     case 'logic':           {return defaultIcon;}
     case 'int':             {return intIcon;}
@@ -263,7 +270,7 @@ export class NetlistTreeDataProvider implements vscode.TreeDataProvider<NetlistI
 }
 
 // #region NetlistItem
-export class NetlistItem extends vscode.TreeItem {
+export class NetlistItem extends vscode.TreeItem implements NetlistTreeItemData {
 
   //public numberFormat: string;
   public fsdbVarLoaded: boolean = false; // Only used in fsdb
@@ -398,7 +405,7 @@ export class VaporviewStatusBar {
     this.selectedSignalStatusBarItem.hide();
   }
 
-  update(document: VaporviewDocument, event: any) {
+  update(document: VaporviewDocument, event: WebviewStateEvent) {
     //this.deltaTimeStatusBarItem.hide();
     //this.markerTimeStatusBarItem.hide();
     //this.selectedSignalStatusBarItem.hide();
@@ -408,11 +415,12 @@ export class VaporviewStatusBar {
 
     //console.log(event);
 
+    const timeUnit = event.displayTimeUnit || w.displayTimeUnit;
     if (w.markerTime || w.markerTime === 0) {
-      this.markerTimeStatusBarItem.text = 'Time: ' + document.formatTime(w.markerTime, event.displayTimeUnit);
+      this.markerTimeStatusBarItem.text = 'Time: ' + document.formatTime(w.markerTime, timeUnit);
       if (w.altMarkerTime !== null && w.markerTime !== null) {
         const deltaT = w.markerTime - w.altMarkerTime;
-        this.deltaTimeStatusBarItem.text = 'Δt: ' + document.formatTime(deltaT, event.displayTimeUnit);
+        this.deltaTimeStatusBarItem.text = 'Δt: ' + document.formatTime(deltaT, timeUnit);
         this.deltaTimeStatusBarItem.show();
       } else {
         this.deltaTimeStatusBarItem.hide();
@@ -420,7 +428,7 @@ export class VaporviewStatusBar {
     } else {
       this.deltaTimeStatusBarItem.hide();
       //this.markerTimeStatusBarItem.hide();
-      this.markerTimeStatusBarItem.text = 'Time Units: ' + event.displayTimeUnit;
+      this.markerTimeStatusBarItem.text = 'Time Units: ' + timeUnit;
     }
     this.markerTimeStatusBarItem.show();
 
@@ -429,12 +437,12 @@ export class VaporviewStatusBar {
       const signalName = netlistData.name;
       this.selectedSignalStatusBarItem.text = 'Selected signal: ' + signalName;
 
-      if (event.transitionCount !== null) {
+      if (event.transitionCount !== undefined && event.transitionCount !== null) {
         const plural = event.transitionCount === 1 ? ')' : 's)';
         this.selectedSignalStatusBarItem.text += ' (' + event.transitionCount + ' value change' + plural;
       }
       this.selectedSignalStatusBarItem.show();
-    } else if (event.selectedSignalCount > 1) {
+    } else if (event.selectedSignalCount !== undefined && event.selectedSignalCount > 1) {
       this.selectedSignalStatusBarItem.text = event.selectedSignalCount + ' signals selected';
     } else {
       this.selectedSignalStatusBarItem.hide();

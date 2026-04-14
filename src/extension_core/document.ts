@@ -1,29 +1,79 @@
 import * as vscode from 'vscode';
-import { type SignalId, type NetlistId, StateChangeType, type QueueEntry, type EnumQueueEntry, type DocumentId, type SavedRowItem, VariableEncoding, type BitRangeSource } from '../common/types';
+import { type SignalId, type NetlistId, StateChangeType, type QueueEntry, type EnumQueueEntry, type DocumentId, type SavedRowItem, VariableEncoding, type BitRangeSource, type AddVariableSignal, InitMessage, WaveformDumpMetadata, ConfigSettingsMessage } from '../common/types';
+import type { GetValuesAtTimeArgs, ValuesAtTimeResult } from '../../packages/vaporview-api/types';
 import { bitRangeString, logScaleFromUnits, parseParamValue, toStringWithCommas } from '../common/functions';
 import { NetlistLinkProvider } from './terminal_links';
 import * as path from 'path';
 import type { VaporviewDocumentCollection, VaporviewDocumentDelegate } from './viewer_provider';
 import { getVarIcon, getScopeIcon, type NetlistItem } from './tree_view';
+import type { FsdbFormatHandler } from './fsdb_handler';
 
-export type WaveformDumpMetadata = {
-  timeTableLoaded: boolean;
-  scopeCount: number;
-  netlistIdCount: number;
-  signalIdCount: number;
-  timeTableCount: number;
-  timeEnd: number;
-  defaultZoom: number;
-  timeScale: number;
-  timeUnit: string;
-  chunkSize: number;
-  fileType?: string;
-  simVersion?: string;
-  simDate?: string;
-  maxVarIdcode?: number;
-};
 
 export type NetlistIdTable = NetlistItem[];
+
+export type SignalInfo = {
+  name: string;
+  netlistId?: NetlistId;
+  msb?: number;
+  lsb?: number;
+  dataType?: string;
+  source?: SignalInfoSource[];
+  children?: SignalInfo[];
+};
+
+export type SignalInfoSource = {
+  name: string;
+  netlistId?: NetlistId;
+  signalWidth: number;
+  msb: number;
+  lsb: number;
+};
+
+export type ParsedSignalData = SignalInfo & {
+  signalId?: SignalId;
+  signalName?: string;
+  scopePath?: string[];
+  signalWidth?: number;
+  type?: string;
+  encoding?: VariableEncoding;
+  enumType?: string;
+};
+
+export type ConvertedSignalListResult = {
+  missingSignals: string[];
+  signalList: ParsedSignalData[];
+};
+
+export type CustomVariableParseResult = {
+  dataValid: boolean;
+  signalData: ParsedSignalData;
+  missingSignals: string[];
+};
+
+export type WebviewStateSettings = {
+  displayedSignals?: SavedRowItem[] | ParsedSignalData[];
+  markerTime?: number | null;
+  altMarkerTime?: number | null;
+  displayTimeUnit?: string;
+  selectedSignal?: { name: string; msb: number; lsb: number } | null;
+  zoomRatio?: number;
+  scrollLeft?: number;
+  autoReload?: boolean;
+};
+
+export type WebviewStateEvent = {
+  stateChangeType?: StateChangeType;
+  markerTime?: number;
+  altMarkerTime?: number;
+  displayTimeUnit?: string;
+  selectedSignal?: NetlistId | null;
+  displayedSignals?: SavedRowItem[];
+  zoomRatio?: number;
+  scrollLeft?: number;
+  autoReload?: boolean;
+  transitionCount?: number | null;
+  selectedSignalCount?: number;
+};
 
 /* 
 Interface for waveform file parsers
@@ -42,18 +92,19 @@ export interface WaveformFileParser {
   getChildren(element: NetlistItem | undefined): Promise<NetlistItem[]>;
   getSignalData(signalIdList: SignalId[]): Promise<void>;
   getEnumData(enumList: EnumQueueEntry[]): Promise<void>;
-  getValuesAtTime(time: number, instancePaths: string[]): Promise<any>;
+  getValuesAtTime(time: number, instancePaths: string[]): Promise<ValuesAtTimeResult[]>;
   searchNetlist(searchString: string): Promise<NetlistSearchResult>
   getValueChangesForSignal?(signalId: SignalId): Promise<any>;
 
   // Callbacks
-  postMessageToWebview(message: any): void;
+  postMessageToWebview(message: Record<string, unknown>): void;
 }
 
 class WebviewState {
   markerTime: number | null = null;
   altMarkerTime: number | null = null;
   selectedSignal: NetlistId | null = null;
+  displayTimeUnit: string = "ns";
   zoomRatio: number = 1;
   scrollLeft: number = 0;
   autoReload: boolean = false;
@@ -106,14 +157,13 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     this.setupFileWatcher();
   }
 
-  static async create(uri: vscode.Uri, providerDelegate: VaporviewDocumentDelegate, documentCollection: VaporviewDocumentCollection): Promise<VaporviewDocument> {
-    const handler  = await providerDelegate.createFileParser(uri);
+  static async create(uri: vscode.Uri, handler: WaveformFileParser, providerDelegate: VaporviewDocumentDelegate, documentCollection: VaporviewDocumentCollection): Promise<VaporviewDocument> {
     const fileType = uri.fsPath.split('.').pop()?.toLocaleLowerCase() || '';
     const documentId = documentCollection.createUniqueDocumentId();
     const document = new VaporviewDocument(uri, providerDelegate, handler, documentId);
     documentCollection.add(documentId, document);
     if (fileType === 'fsdb') {
-      (document._handler as any).findTreeItemFn = document.findTreeItem.bind(document);
+      (document._handler as FsdbFormatHandler).findTreeItemFn = document.findTreeItem.bind(document);
     }
     return document;
   }
@@ -135,7 +185,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     this.onDoneParsingWaveforms();
   }
 
-  public postMessageToWebview(message: any): void {
+  public postMessageToWebview(message: Record<string, unknown>): void {
     this.webviewPanel?.webview.postMessage(message);
   }
 
@@ -182,10 +232,11 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       command: 'initViewport',
       metadata: this.metadata,
       documentId: this.documentId,
-      uri: this.uri,
+      uri: this.uri.toString(),
       colorPalette: colorPalette.colorPalette,
       errorColorPalette: colorPalette.errorColorPalette,
-    });
+      themeValid: colorPalette.themeValid,
+    } as InitMessage);
     this.setConfigurationSettings();
     this._webviewInitialized = true;
   }
@@ -193,34 +244,24 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   public setConfigurationSettings() {
     const config = vscode.workspace.getConfiguration('vaporview');
 
-    const scrollingMode            = config.get('scrollingMode');
-    const rulerLines               = config.get('showRulerLines');
-    const fillMultiBitValues       = config.get('fillMultiBitValues');
-    const multiBitFixedHeight      = config.get('multiBitFixedHeight');
-    const enableAnimations         = config.get('enableAnimations');
-    const animationDuration        = config.get('animationDuration');
-    const overrideDevicePixelRatio = config.get('overrideDevicePixelRatio');
-    const disableOptimizations     = config.get('disableAnalogRendererOptimizations');
-    const userPixelRatio           = config.get('userPixelRatio');
-
-    const color1 = config.get('customColor1');
-    const color2 = config.get('customColor2');
-    const color3 = config.get('customColor3');
-    const color4 = config.get('customColor4');
-
     this.webviewPanel?.webview.postMessage({
       command: 'setConfigSettings',
-      scrollingMode: scrollingMode,
-      rulerLines: rulerLines,
-      overrideDevicePixelRatio: overrideDevicePixelRatio,
-      userPixelRatio: userPixelRatio,
-      fillMultiBitValues: fillMultiBitValues,
-      multiBitFixedHeight: multiBitFixedHeight,
-      enableAnimations: enableAnimations,
-      animationDuration: animationDuration,
-      disableAnalogRendererOptimizations: disableOptimizations,
-      customColors: [color1, color2, color3, color4],
-    });
+      scrollingMode:                      config.get('scrollingMode'),
+      rulerLines:                         config.get('showRulerLines'),
+      overrideDevicePixelRatio:           config.get('overrideDevicePixelRatio'),
+      userPixelRatio:                     config.get('userPixelRatio'),
+      fillMultiBitValues:                 config.get('fillMultiBitValues'),
+      multiBitFixedHeight:                config.get('multiBitFixedHeight'),
+      enableAnimations:                   config.get('enableAnimations'),
+      animationDuration:                  config.get('animationDuration'),
+      disableAnalogRendererOptimizations: config.get('disableAnalogRendererOptimizations'),
+      defaultSingleBitColor:              config.get('defaultSingleBitColor'),
+      defaultMultiBitColor:               config.get('defaultMultiBitColor'),
+      defaultParamColor:                  config.get('defaultParamColor'),
+      defaultStringColor:                 config.get('defaultStringColor'),
+      defaultEnumColor:                   config.get('defaultEnumColor'),
+      defaultCustomSignalColor:           config.get('defaultCustomSignalColor'),
+    } as ConfigSettingsMessage);
 
     this.setTerminalLinkProvider();
   }
@@ -236,7 +277,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   }
 
   // #region Webview state management
-  public captureWebviewState(event: any): boolean {
+  public captureWebviewState(event: WebviewStateEvent): boolean {
 
     let isDirty = false;
     //console.log(event.stateChangeType);
@@ -255,8 +296,11 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     if (event.altMarkerTime || event.altMarkerTime === 0) {
       this.webviewContext.altMarkerTime = event.altMarkerTime;
     }
+    if (event.displayTimeUnit) {
+      this.webviewContext.displayTimeUnit = event.displayTimeUnit;
+    }
 
-    this.webviewContext.selectedSignal   = event.selectedSignal;
+    this.webviewContext.selectedSignal   = event.selectedSignal ?? this.webviewContext.selectedSignal;
     this.webviewContext.displayedSignals = event.displayedSignals || this.webviewContext.displayedSignals;
     this.webviewContext.zoomRatio        = event.zoomRatio        || this.webviewContext.zoomRatio;
     this.webviewContext.scrollLeft       = event.scrollLeft       || this.webviewContext.scrollLeft;
@@ -271,6 +315,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       fileName: this.uri.fsPath,
       markerTime: this.webviewContext.markerTime,
       altMarkerTime: this.webviewContext.altMarkerTime,
+      displayTimeUnit: this.webviewContext.displayTimeUnit,
       selectedSignal: this.getNameFromNetlistId(this.webviewContext.selectedSignal),
       zoomRatio: this.webviewContext.zoomRatio,
       scrollLeft: this.webviewContext.scrollLeft,
@@ -278,7 +323,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     };
   }
 
-  public async getNetlistItemFromSignalInfo(signalInfo: any, useNetlistId: boolean): Promise<NetlistItem | null> {
+  public async getNetlistItemFromSignalInfo(signalInfo: SignalInfo | SignalInfoSource, useNetlistId: boolean): Promise<NetlistItem | null> {
     const name = signalInfo.name;
     let metadata: NetlistItem | null = null;
     if (useNetlistId && signalInfo.netlistId !== undefined) {
@@ -289,7 +334,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     return metadata;
   }
 
-  public async parseNetlistVariableSettings(signalInfo: any, useNetlistId: boolean): Promise<any> {
+  public async parseNetlistVariableSettings(signalInfo: SignalInfo, useNetlistId: boolean): Promise<ParsedSignalData> {
     const metadata = await this.getNetlistItemFromSignalInfo(signalInfo, useNetlistId);
     if (metadata !== null) {
       const signalData = Object.assign(signalInfo, {
@@ -306,24 +351,39 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       });
       return signalData;
     } else {
-      return null;
+      //return null;
+      const signalData = Object.assign(signalInfo, {
+        netlistId: undefined,
+        signalId: undefined,
+        signalName: signalInfo.name.split(".").pop() || "",
+        scopePath:  signalInfo.name.split(".").slice(0, -1),
+      });
+      return signalData;
     }
   }
 
-  public async parseCustomVariableSettings(signalInfo: any, useNetlistId: boolean): Promise<any> {
+  public async parseCustomVariableSettings(signalInfo: SignalInfo, useNetlistId: boolean): Promise<CustomVariableParseResult> {
     let dataValid = true;
     const missingSignals: string[] = [];
-    const source = await Promise.all(signalInfo.source.map(async (item: any) => {
+    const source = await Promise.all((signalInfo.source || []).map(async (item: SignalInfoSource) => {
       const metadata = await this.getNetlistItemFromSignalInfo(item, useNetlistId);
+      const defaultSource: BitRangeSource = {
+        name: item.name,
+        netlistId: undefined,
+        signalId: undefined,
+        signalWidth: item.signalWidth,
+        msb: item.msb,
+        lsb: Math.max(item.lsb, 0),
+      };
       if (metadata === null) {
         dataValid = false;
         missingSignals.push(item.name);
-        return null;
+        return defaultSource;
       }
       if (item.lsb >= metadata.width) {
         dataValid = false;
         missingSignals.push(item.name);
-        return null;
+        return defaultSource;
       }
       const source: BitRangeSource = {
         name: metadata.instancePath(),
@@ -346,12 +406,12 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     };
   }
 
-  public async convertSignalListToSettings(signalList: any, useNetlistId: boolean): Promise<any> {
+  public async convertSignalListToSettings(signalList: SignalInfo[], useNetlistId: boolean): Promise<ConvertedSignalListResult> {
     const missingSignals: string[] = [];
-    const settings: any = [];
+    const settings: ParsedSignalData[] = [];
     for (const signalInfo of signalList) {
       if (signalInfo.dataType && signalInfo.dataType === 'signal-group') {
-        const childrenSettings = await this.convertSignalListToSettings(signalInfo.children, useNetlistId);
+        const childrenSettings = await this.convertSignalListToSettings(signalInfo.children ?? [], useNetlistId);
         const groupData = Object.assign({}, signalInfo, {children: childrenSettings.signalList});
         settings.push(groupData);
         missingSignals.push(...childrenSettings.missingSignals);
@@ -359,17 +419,16 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
         settings.push(signalInfo);
       } else if (signalInfo.dataType && signalInfo.dataType === 'custom-variable') {
         const result = await this.parseCustomVariableSettings(signalInfo, useNetlistId);
-        if (result.dataValid) {
-          settings.push(result.signalData);
-        } else {
+        settings.push(result.signalData);
+        if (!result.dataValid) {
           missingSignals.push(...result.missingSignals);
         }
       } else if (signalInfo.dataType === 'netlist-variable' || signalInfo.dataType === undefined) {
         const signalData = await this.parseNetlistVariableSettings(signalInfo, useNetlistId);
         if (signalData !== null) {
           settings.push(signalData);
-        } else if (signalData && signalData.name) {
-          missingSignals.push(signalData.name);
+        } else {
+          missingSignals.push(signalInfo.name);
         }
       }
     }
@@ -380,16 +439,17 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     };
   }
 
-  public async applySettings(settings: any, stateChangeType: StateChangeType, useNetlistId: boolean) {
+  public async applySettings(settings: WebviewStateSettings, stateChangeType: StateChangeType, useNetlistId: boolean) {
 
     //this.netlistTreeDataProvider.loadDocument(document);
     //console.log('applySettings', settings);
-    const signalListSettings = await this.convertSignalListToSettings(settings.displayedSignals, useNetlistId);
+    const signalListSettings = await this.convertSignalListToSettings((settings.displayedSignals || []) as unknown as SignalInfo[], useNetlistId);
     //console.log('signalListSettings', signalListSettings);
-    const documentSettings: any = {
+    const documentSettings: WebviewStateSettings = {
       displayedSignals: signalListSettings.signalList,
       markerTime: settings.markerTime,
       altMarkerTime: settings.altMarkerTime,
+      displayTimeUnit: settings.displayTimeUnit,
       selectedSignal: settings.selectedSignal,
       zoomRatio: settings.zoomRatio,
       scrollLeft: settings.scrollLeft,
@@ -398,15 +458,9 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
 
     //console.log(stateChangeType);
 
-    const color1 = vscode.workspace.getConfiguration('vaporview').get('customColor1');
-    const color2 = vscode.workspace.getConfiguration('vaporview').get('customColor2');
-    const color3 = vscode.workspace.getConfiguration('vaporview').get('customColor3');
-    const color4 = vscode.workspace.getConfiguration('vaporview').get('customColor4');
-
     this.webviewPanel?.webview.postMessage({
       command: 'apply-state',
       settings: documentSettings,
-      customColors: [color1, color2, color3, color4],
       stateChangeType: stateChangeType,
     });
 
@@ -548,10 +602,10 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     return this.getNetlistIdsFromDisplayedSignals(this.webviewContext.displayedSignals);
   }
 
-  public getNetlistIdsFromDisplayedSignals(displayedSignals: any[]): NetlistId[] {
+  public getNetlistIdsFromDisplayedSignals(displayedSignals: SavedRowItem[]): NetlistId[] {
     const result: NetlistId[] = [];
-    displayedSignals.forEach((element: any) => {
-      if (element.dataType === 'netlist-variable') {
+    displayedSignals.forEach((element: SavedRowItem) => {
+      if (element.dataType === 'netlist-variable' && element.netlistId !== undefined) {
         result.push(element.netlistId);
       } else if (element.dataType === 'signal-group') {
         result.push(...this.getNetlistIdsFromDisplayedSignals(element.children));
@@ -567,7 +621,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   }
 
   public async renderSignals(netlistIdList: NetlistId[], moveToGroup: string[] | undefined, index: number | undefined) {
-    const signalList: any = [];
+    const signalList: AddVariableSignal[] = [];
     if (!this.webviewPanel) { return; }
 
     netlistIdList.forEach((netlistId) => {
@@ -680,8 +734,8 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     return this._handler.getEnumData(enumNameList);
   }
 
-  public async getValuesAtTime(e: any): Promise<any> {
-    const time = e.time ?? this.webviewContext.markerTime;
+  public async getValuesAtTime(e: GetValuesAtTimeArgs): Promise<ValuesAtTimeResult[]> {
+    const time = e.time ?? this.webviewContext.markerTime ?? 0;
     return this._handler.getValuesAtTime(time, e.instancePaths);
   }
 
@@ -802,6 +856,7 @@ export class NetlistSearchQuickPick {
   constructor() {
     this.quickPick = vscode.window.createQuickPick<NetlistQuickPickItem>();
     this.quickPick.placeholder = 'Search netlist by instance path...';
+    this.quickPick.matchOnDetail = true;
     this.quickPick.busy = false;
     this.quickPick.onDidHide(() => {this.quickPick.value = "";});
 
@@ -837,15 +892,24 @@ export class NetlistSearchQuickPick {
 
     const totalResults     = searchResult.totalResults;
     const displayedResults = searchResult.searchResults.length;
-    this.quickPick.title   = `Showing ${displayedResults} of ${totalResults} results`;
+    const resultString     = totalResults === 1 ? "result" : "results";
+
+    if (totalResults === 0) {
+      this.quickPick.title = "No results found";
+    } else if (displayedResults !== totalResults) {
+      this.quickPick.title = `Showing ${displayedResults} of ${totalResults} ${resultString}`;
+    } else {
+      this.quickPick.title = `${totalResults} ${resultString}`;
+    }
 
     this.quickPick.items = searchResult.searchResults.map(result => {
       const icon       = result.isVar ? getVarIcon(result.type) : getScopeIcon(result.type);
       const bitRange   = result.isVar ? bitRangeString(result.msb, result.lsb) : "";
       const paramValue = result.paramValue ? ": " + parseParamValue(result.paramValue) : "";
       return {
-        label: result.instancePath + bitRange,
+        label: result.instancePath.slice(result.instancePath.lastIndexOf(".") + 1) + bitRange,
         description: result.type + paramValue,
+        detail: result.instancePath,
         instancePath: result.instancePath,
         isVar: result.isVar,
         msb: result.msb || 0,

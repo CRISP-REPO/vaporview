@@ -1,6 +1,6 @@
 import { type NetlistId, type RowId, type ValueChange, EnumData, EnumEntry, NameType, VariableEncoding, CollapseState, type BitRangeSource, type SignalSeparatorContext, type NetlistVariableContext, CustomVariableContext, SignalGroupContext, SavedRowItem, SavedSignalSeparator, SavedNetlistVariable, SavedCustomVariable, SavedSignalGroup } from '../common/types';
-
-import { dataManager, viewport, viewerState, updateDisplayedSignalsFlat, events, ActionType, getRowHeightCssClass, rowHandler, vscodeWrapper, styles } from "./vaporview";
+import { ActionType, type EventHandler } from './event_handler';
+import { dataManager, viewport, viewerState, updateDisplayedSignalsFlat, events, getRowHeightCssClass, rowHandler, vscodeWrapper, styles, config } from "./vaporview";
 import { EnumValueFormat, formatBinary, formatHex, formatString, type ValueFormat } from "./value_format";
 import { type WaveformRenderer, setRenderBounds } from "./renderer";
 import type { WaveformData } from "./data_manager";
@@ -78,7 +78,7 @@ export abstract class SignalItem {
   public getFlattenedRowIdList(ignoreCollapsed: boolean, ignoreRowId: number): number[] {return [this.rowId];}
   public rowIdCount(ignoreCollapsed: boolean, stopIndex: number): number {return 1;}
   public findParentGroupId(rowId: RowId): number | null {return null;}
-  public formatValue(value: any): string {return "";}
+  public formatValue(value: string): string {return "";}
   public getWaveformData(): WaveformData | undefined {return undefined;}
   public renderWaveform() {return;}
   public handleValueLink(time: number, snapToTime: number) {return false;}
@@ -206,8 +206,8 @@ export class NetlistVariable extends SignalItem implements RowItem {
 
   constructor(
     public readonly rowId: RowId,
-    public readonly netlistId: number,
-    public signalId: number,
+    public readonly netlistId: number | undefined,
+    public signalId: number | undefined,
     public signalName: string,
     public scopePath: string[],
     public signalWidth: number,
@@ -219,16 +219,31 @@ export class NetlistVariable extends SignalItem implements RowItem {
     super();
 
     this.customName = this.signalName;
+
+    this.colorIndex = 1;
+    if (this.signalWidth === 1) {
+      this.colorIndex = config.defaultSingleBitColor;
+    } else {
+      this.colorIndex = config.defaultMultiBitColor;
+    }
+
     if (this.encoding === VariableEncoding.String) {
       this.valueFormat = formatString;
-      this.colorIndex  = 1;
+      this.colorIndex  = config.defaultStringColor;
     } else if (this.encoding === VariableEncoding.Real) {
       this.valueFormat = formatString;
+      this.colorIndex  = config.defaultMultiBitColor;
     } else if (this.enumType !== "") {
       this.valueFormat = new EnumValueFormat(this.enumType);
+      this.colorIndex  = config.defaultEnumColor;
     } else {
       this.valueFormat = this.signalWidth === 1 ? formatBinary : formatHex;
     }
+
+    if (this.variableType === 'Parameter') {
+      this.colorIndex = config.defaultParamColor;
+    }
+
     this.setSignalContextAttribute();
     this.setColorFromColorIndex();
   }
@@ -250,13 +265,15 @@ export class NetlistVariable extends SignalItem implements RowItem {
 
   public createLabelElement() {
 
+    let missingSignalClass = "";
+    if (this.signalId === undefined) {missingSignalClass = 'missing-signal';}
     const height        = getRowHeightCssClass(this.rowHeight);
     const signalName    = htmlSafe(this.signalName);
     const instancePath  = htmlSafe(createInstancePath(this.scopePath, signalName));
     const fullPath      = htmlAttributeSafe(instancePath);
     const isSelectedClass   = this.isSelected ? 'is-selected' : '';
     const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
-    const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
+    const selectorClass = isSelectedClass + ' ' + lastSelectedClass + ' ' + missingSignalClass;
     const tooltip       = "Name: " + fullPath + "\nType: " + this.variableType + "\nWidth: " + this.signalWidth + "\nEncoding: " + this.encoding;
     return `<div class="waveform-label is-idle" id="label-${this.rowId}" title="${tooltip}" data-vscode-context=${this.vscodeContext}>
               <div class='waveform-row ${selectorClass} ${height}'>${this.createWaveformRowContent()}</div>
@@ -265,7 +282,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
 
   public createValueDisplayElement() {
     let   value = labelsPanel.valueAtMarker[this.rowId];
-    if (value === undefined) {value = [];}
+    if (value === undefined || this.signalId === undefined) {value = [];}
     const isSelectedClass   = this.isSelected ? 'is-selected' : '';
     const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
     const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
@@ -275,7 +292,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
     const valueIs9State = this.valueFormat.is9State;
     const pElement      = value.map((v: string) => {
       const is9State     = valueIs9State(v);
-      const colorStyle   = is9State ? 'var(--vscode-debugTokenExpression-error)' : this.color;
+      const colorStyle   = is9State ? styles.xzColor : this.color;
       const displayValue = parseValue(v, this.signalWidth, !is9State);
       return `<p style="color:${colorStyle}">${displayValue}</p>`;
     }).join(joinString);
@@ -313,7 +330,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
       width: this.signalWidth,
       preventDefaultContextMenuItems: true,
       commandValid: this.valueLinkCommand !== "",
-      netlistId: this.netlistId,
+      netlistId: this.netlistId!,
       rowId: this.rowId,
       isAnalog: isAnalog,
       enum: this.enumType !== "",
@@ -359,6 +376,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
 
   public renderWaveform() {
 
+    if (this.signalId === undefined) {return;}
     const data = dataManager.valueChangeData[this.signalId];
 
     if (!data) {return;}
@@ -370,16 +388,19 @@ export class NetlistVariable extends SignalItem implements RowItem {
   }
 
   public getValueAtTime(time: number | null) {
+    if (this.signalId === undefined) {return [];}
     const data = dataManager.valueChangeData[this.signalId];
     return dataManager.getValueAtTime(data, time);
   }
 
   public getNearestTransition(time: number | null): ValueChange | null {
+    if (this.signalId === undefined) {return null;}
     const data = dataManager.valueChangeData[this.signalId];
     return dataManager.getNearestTransition(data, time);
   }
 
   public getWaveformData(): WaveformData | undefined {
+    if (this.signalId === undefined) {return undefined;}
     return dataManager.valueChangeData[this.signalId];
   }
 
@@ -388,11 +409,13 @@ export class NetlistVariable extends SignalItem implements RowItem {
   }
 
   public getAllEdges(valueList: string[]): number[] {
+    if (this.signalId === undefined) {return [];}
     const data = dataManager.valueChangeData[this.signalId];
     return dataManager.getAllEdges(valueList, data, this.signalWidth);
   }
 
   public getNextEdge(time: number, direction: number, valueList: string[]): number | null {
+    if (this.signalId === undefined) {return null;}
     const data = dataManager.valueChangeData[this.signalId];
     return dataManager.getNextEdge(data, time, direction, valueList);
   }
@@ -413,6 +436,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
 
   handleValueLink(time: number, snapToTime: number): boolean {
 
+    if (this.signalId === undefined) {return false;}
     const data = dataManager.valueChangeData[this.signalId];
 
     if (!data) {return false;}
@@ -462,7 +486,7 @@ export class CustomVariable extends SignalItem implements RowItem {
   public valueLinkCommand: string = "";
   public valueLinkBounds: [number, number][] = [];
   public valueLinkIndex: number = -1;
-  public colorIndex: number = 0;
+  public colorIndex: number = config.defaultCustomSignalColor;
   public color: string = "";
   public rowHeight: number = 1;
   public wasRendered: boolean = false;
@@ -480,7 +504,7 @@ export class CustomVariable extends SignalItem implements RowItem {
   constructor(
     public rowId: number,
     public source: BitRangeSource[],
-    public customSignalId: number,
+    public customSignalId: number | undefined,
     public signalName: string,
     public signalWidth: number,
     public renderType: WaveformRenderer,
@@ -503,11 +527,13 @@ export class CustomVariable extends SignalItem implements RowItem {
 
   public createLabelElement() {
 
+    let missingSignalClass = "";
+    if (this.customSignalId === undefined) {missingSignalClass = 'missing-signal';}
     const height        = getRowHeightCssClass(this.rowHeight);
     const signalName    = htmlSafe(this.signalName);
     const isSelectedClass   = this.isSelected ? 'is-selected' : '';
     const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
-    const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
+    const selectorClass = isSelectedClass + ' ' + lastSelectedClass + ' ' + missingSignalClass;
     const tooltip       = "Name: " + signalName + "\nType: " + this.variableType + "\nWidth: " + this.signalWidth + "\nEncoding: " + this.encoding;
     return `<div class="waveform-label is-idle" id="label-${this.rowId}" title="${tooltip}" data-vscode-context=${this.vscodeContext}>
               <div class='waveform-row ${selectorClass} ${height}'>${this.createWaveformRowContent()}</div>
@@ -517,7 +543,7 @@ export class CustomVariable extends SignalItem implements RowItem {
     public createValueDisplayElement() {
 
       let   value = labelsPanel.valueAtMarker[this.rowId];
-      if (value === undefined) {value = [];}
+      if (value === undefined || this.customSignalId === undefined) {value = [];}
       const isSelectedClass   = this.isSelected ? 'is-selected' : '';
       const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
       const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
@@ -527,7 +553,7 @@ export class CustomVariable extends SignalItem implements RowItem {
       const valueIs9State = this.valueFormat.is9State;
       const pElement      = value.map((v: string) => {
         const is9State     = valueIs9State(v);
-        const colorStyle   = is9State ? 'var(--vscode-debugTokenExpression-error)' : this.color;
+        const colorStyle   = is9State ? styles.xzColor : this.color;
         const displayValue = parseValue(v, this.signalWidth, !is9State);
         return `<p style="color:${colorStyle}">${displayValue}</p>`;
       }).join(joinString);
@@ -606,6 +632,7 @@ export class CustomVariable extends SignalItem implements RowItem {
 
   public renderWaveform() {
 
+    if (this.customSignalId === undefined) {return;}
     const data = dataManager.customValueChangeData[this.customSignalId];
 
     if (!data) {return;}
@@ -619,16 +646,19 @@ export class CustomVariable extends SignalItem implements RowItem {
   }
 
   public getValueAtTime(time: number | null) {
+    if (this.customSignalId === undefined) {return [];}
     const data = dataManager.customValueChangeData[this.customSignalId];
     return dataManager.getValueAtTime(data, time);
   }
 
   public getNearestTransition(time: number | null): ValueChange | null {
+    if (this.customSignalId === undefined) {return null;}
     const data = dataManager.customValueChangeData[this.customSignalId];
     return dataManager.getNearestTransition(data, time);
   }
 
   public getWaveformData(): WaveformData | undefined {
+    if (this.customSignalId === undefined) {return undefined;}
     return dataManager.customValueChangeData[this.customSignalId];
   }
 
@@ -637,11 +667,13 @@ export class CustomVariable extends SignalItem implements RowItem {
   }
 
   public getAllEdges(valueList: string[]): number[] {
+    if (this.customSignalId === undefined) {return [];}
     const data = dataManager.customValueChangeData[this.customSignalId];
     return dataManager.getAllEdges(valueList, data, this.signalWidth);
   }
 
   public getNextEdge(time: number, direction: number, valueList: string[]): number | null {
+    if (this.customSignalId === undefined) {return null;}
     const data = dataManager.customValueChangeData[this.customSignalId];
     return dataManager.getNextEdge(data, time, direction, valueList);
   }
@@ -846,7 +878,7 @@ export class SignalGroup extends SignalItem implements RowItem {
       if (lastSelected !== null && childRows.includes(lastSelected)) {
         lastSelected = null;
       }
-      events.dispatch(ActionType.SignalSelect, newSelection, lastSelected);
+      events.signalSelect(newSelection, lastSelected);
     }
     labelsPanel.renderLabelsPanels();
     this.showHideViewportRows();

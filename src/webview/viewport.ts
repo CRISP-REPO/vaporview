@@ -1,6 +1,7 @@
-import { NetlistId, SignalId, type RowId, EnumData, EnumEntry, StateChangeType, type DocumentId, type DefaultWebviewContext, type RulerContext } from '../common/types';
+import { NetlistId, SignalId, type RowId, EnumData, EnumEntry, StateChangeType, type DocumentId, type DefaultWebviewContext, type RulerContext, type WaveformDumpMetadata } from '../common/types';
 import { logScaleFromUnits } from '../common/functions';
-import { ActionType, type EventHandler, viewerState, dataManager, updateDisplayedSignalsFlat, handleClickSelection, controlBar, MouseUpEventType } from "./vaporview";
+import { ActionType, type EventHandler } from './event_handler';
+import { viewerState, dataManager, updateDisplayedSignalsFlat, handleClickSelection, controlBar, MouseUpEventType } from "./vaporview";
 import { ValueFormat } from './value_format';
 import { WaveformRenderer } from './renderer';
 import { labelsPanel, rowHandler, vscodeWrapper, styles, config } from "./vaporview";
@@ -28,10 +29,10 @@ export class Viewport {
   netlistLinkElement: HTMLElement | null = null;
   valueLinkObject: NetlistVariable | null = null;
 
-  highlightEndEvent: any    = null;
-  highlightStartEvent: any  = null;
+  highlightEndEvent: MouseEvent | null    = null;
+  highlightStartEvent: MouseEvent | null  = null;
   highlightListenerSet      = false;
-  highlightDebounce: any    = null;
+  highlightDebounce: ReturnType<typeof setTimeout> | null    = null;
 
   // Scroll handler variables
   pseudoScrollLeft: number    = 0;
@@ -171,7 +172,7 @@ export class Viewport {
     this.handleSignalSelect(viewerState.selectedSignal, viewerState.lastSelectedSignal);
   }
 
-  initViewport(metadata: any) {
+  initViewport(metadata: WaveformDumpMetadata) {
     this.setPixelRatio();
     this.defaultZoom     = metadata.defaultZoom;
     this.zoomRatio       = metadata.defaultZoom;
@@ -346,7 +347,7 @@ export class Viewport {
     }
   }
 
-  handleScrollAreaClick(event: any, eventButton: number) {
+  handleScrollAreaClick(event: MouseEvent, eventButton: number) {
 
     let button = eventButton;
 
@@ -361,33 +362,46 @@ export class Viewport {
     let snapToTime = time;
 
     // Get the signal id of the click
-    const rowId      = this.getRowIdFromMouseEvent(event);
-    if (rowId === null) {return;}
+    const rowId    = this.getRowIdFromMouseEvent(event);
+    if (rowId === null) {
+      rowHandler.deselectAllSignals();
+      return;
+    }
     const signalItem = rowHandler.rowItems[rowId];
     if (!signalItem) {return;}
 
+    let updateContext = false;
     if (signalItem instanceof NetlistVariable || signalItem instanceof CustomVariable) {
       // Snap to the nearest transition if the click is close enough
       const nearestTransition = signalItem.getNearestTransition(time);
 
-      if (nearestTransition === null) {return;}
+      // only set the marker if we're actually clicking on a waveform
+      if (nearestTransition !== null) {
 
-      const nearestTime   = nearestTransition[0];
-      const pixelDistance = Math.abs(nearestTime - time) * this.zoomRatio;
+        const nearestTime   = nearestTransition[0];
+        const pixelDistance = Math.abs(nearestTime - time) * this.zoomRatio;
 
-      if (pixelDistance < snapToDistance) {snapToTime = nearestTime;}
+        if (pixelDistance < snapToDistance) {snapToTime = nearestTime;}
 
-      if (button === 0 && (event.ctrlKey || event.metaKey)) {
-        const linkClicked = signalItem.handleValueLink(time, snapToTime);
-        if (linkClicked) {return;}
-      }
-      if (!(event.ctrlKey || event.shiftKey || event.metaKey)) {
-        this.events.dispatch(ActionType.MarkerSet, snapToTime, button);
+        if (button === 0 && (event.ctrlKey || event.metaKey)) {
+          const linkClicked = signalItem.handleValueLink(time, snapToTime);
+          if (linkClicked) {return;}
+        }
+        if (!(event.ctrlKey || event.shiftKey || event.metaKey)) {
+          this.events.markerSet(snapToTime, button);
+          updateContext = true;
+        }
       }
     }
 
     if (button === 0) {
+      // This will call sendWebviewContext(), so we don't need to call it again below
       handleClickSelection(event, rowId);
+      updateContext = false;
+    }
+
+    if (updateContext) {
+      vscodeWrapper.sendWebviewContext(StateChangeType.User);
     }
   }
 
@@ -437,6 +451,7 @@ export class Viewport {
   highlightZoom(abort: boolean) {
     this.updateOverlayCanvas();
     if (abort) {return;}
+    if (!this.highlightStartEvent || !this.highlightEndEvent) {return;}
     const timeStart = this.getTimeFromClick(this.highlightStartEvent);
     const timeEnd   = this.getTimeFromClick(this.highlightEndEvent);
     const time      = Math.round((timeStart + timeEnd) / 2);
@@ -451,6 +466,7 @@ export class Viewport {
     this.updateOverlayCanvas();
     const ctx = this.overlayCanvas;
     this.highlightEndEvent = event;
+    if (!this.highlightStartEvent) {return;}
     const width       = Math.abs(this.highlightEndEvent.pageX - this.highlightStartEvent.pageX);
     const left        = Math.min(this.highlightStartEvent.pageX, this.highlightEndEvent.pageX);
     const elementLeft = left - this.scrollAreaBounds.left;
@@ -650,7 +666,15 @@ export class Viewport {
   }
 
   updateUnits(units: string, updateContext: boolean) {
-    this.displayTimeUnit = units;
+    const validUnits = ['fs', 'ps', 'ns', 'µs', 'us', 'ms', 's'];
+
+    if (!validUnits.includes(units)) {return;}
+    if (units === this.displayTimeUnit) {return;}
+
+    let newUnits = units;
+    if (units === 'us') {newUnits = 'µs';}
+
+    this.displayTimeUnit = newUnits;
     this.adjustedLogTimeScale = logScaleFromUnits(this.timeUnit) - logScaleFromUnits(units);
     if (viewerState.markerTime !== null) {
       this.markerLabelElement.innerText = this.scaleTime(viewerState.markerTime) + ' ' + this.displayTimeUnit;
@@ -769,8 +793,8 @@ export class Viewport {
     // Annotation lines
     const startIndex = dataManager.binarySearchTime(this.annotateTime, this.timeScrollLeft);
     const endIndex   = dataManager.binarySearchTime(this.annotateTime, this.timeScrollRight);
-    const lineList: any= [];
-    const boxList: any[] = [];
+    const lineList: number[]= [];
+    const boxList: [number, number][] = [];
     let noDrawFlag   = false;
     let lastDrawTime = 0;
     let lastNoDrawTime = 0;
@@ -838,6 +862,9 @@ export class Viewport {
 
     ctx.setLineDash([6, 2, 2, 2]);
     if (viewerState.altMarkerTime !== null) {
+      if (viewerState.altMarkerTime === viewerState.markerTime) {
+        ctx.setLineDash([]);
+      }
     const altMarkerX = this.getViewportLeft(viewerState.altMarkerTime, 100);
       ctx.beginPath();
       ctx.moveTo(altMarkerX, styles.rulerHeight);

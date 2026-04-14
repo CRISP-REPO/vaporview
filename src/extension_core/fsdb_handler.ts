@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import type { EnumQueueEntry, SignalId, NetlistId, ValueChangeDataChunk } from '../common/types';
+import type { EnumQueueEntry, SignalId, NetlistId, ValueChangeDataChunk, WaveformDumpMetadata } from '../common/types';
 import { type ChildProcess, fork, exec, spawn } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -7,18 +7,92 @@ import * as crypto from 'crypto';
 
 import type { VaporviewDocumentDelegate } from './viewer_provider';
 import { type NetlistItem, createScope, createVar } from './tree_view';
-import type { WaveformFileParser, WaveformDumpMetadata, NetlistSearchResult, NetlistSearchEntry } from './document';
+import type { WaveformFileParser, NetlistSearchResult, NetlistSearchEntry } from './document';
+import type { ValuesAtTimeResult } from '../../packages/vaporview-api/types';
+import type { FsdbWaveformData, FsdbWorkerCommand } from './fsdb_types';
 
-type FsdbWorkerMessage = {
+// Response to a callFsdbWorkerTask request (matched by id)
+type FsdbWorkerResponse = {
   id: string;
-  result: any;
+  result?: unknown;
+  error?: unknown;
 };
 
-type FsdbWaveformData = {
-  valueChanges: [number, string][];
-  min: number;
-  max: number;
+// Callback messages sent by the worker (no matching id)
+type FsdbRequireFailedMessage = {
+  command: 'require-failed';
+  error: { code?: string };
 };
+
+type FsdbScopeCallbackMessage = {
+  command: 'fsdb-scope-callback';
+  name: string;
+  type: string;
+  path: string;
+  netlistId: number;
+  scopeOffsetIdx: number;
+};
+
+type FsdbUpscopeCallbackMessage = {
+  command: 'fsdb-upscope-callback';
+};
+
+type FsdbSetMetadataMessage = {
+  command: 'setMetadata';
+  scopecount: number;
+  varcount: number;
+  timescale: number;
+  timeunit: string;
+  fileType?: string;
+  simVersion?: string;
+  simDate?: string;
+  maxVarIdcode?: number;
+};
+
+type FsdbSetChunkSizeMessage = {
+  command: 'setChunkSize';
+  chunksize: number;
+  timeend: number;
+  timetablelength?: number;
+};
+
+type FsdbVarCallbackMessage = {
+  command: 'fsdb-var-callback';
+  name: string;
+  type: string;
+  encoding: string;
+  path: string;
+  netlistId: number;
+  signalId: number;
+  width: number;
+  msb: number;
+  lsb: number;
+};
+
+type FsdbArrayBeginCallbackMessage = {
+  command: 'fsdb-array-begin-callback';
+  name: string;
+  path: string;
+  netlistId: number;
+};
+
+type FsdbArrayEndCallbackMessage = {
+  command: 'fsdb-array-end-callback';
+  size: number;
+};
+
+type FsdbWorkerCallback =
+  | FsdbRequireFailedMessage
+  | FsdbScopeCallbackMessage
+  | FsdbUpscopeCallbackMessage
+  | FsdbSetMetadataMessage
+  | FsdbSetChunkSizeMessage
+  | FsdbVarCallbackMessage
+  | FsdbArrayBeginCallbackMessage
+  | FsdbArrayEndCallbackMessage;
+
+type FsdbWorkerMessage = FsdbWorkerResponse | FsdbWorkerCallback;
+
 
 export class FsdbFormatHandler implements WaveformFileParser {
   private providerDelegate: VaporviewDocumentDelegate;
@@ -27,7 +101,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
   private fsdbTopModuleCount: number = 0;
   private fsdbCurrentScope: NetlistItem | undefined = undefined;
   // Need a reference to findTreeItem for getValuesAtTime
-  private findTreeItemFn: (scopePath: string, msb: number | undefined, lsb: number | undefined) => Promise<NetlistItem | null>;
+  public findTreeItemFn: (scopePath: string, msb: number | undefined, lsb: number | undefined) => Promise<NetlistItem | null>;
 
   // SSH remote mode
   private isSSHRemote: boolean = false;
@@ -41,7 +115,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
   private netlistTop: NetlistItem[] = [];
   private parametersLoaded: boolean = false;
 
-  public postMessageToWebview = (message: any) => {};
+  public postMessageToWebview = (_message: Record<string, unknown>) => {};
   public metadata: WaveformDumpMetadata = {
     timeTableLoaded: false,
     scopeCount: 0,
@@ -911,7 +985,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
       log('[FSDB] worker error: ' + err.message);
     });
 
-    this.fsdbWorker.on('exit', (code: any, signal: any) => {
+    this.fsdbWorker.on('exit', (code: number | null, signal: string | null) => {
       log(`[FSDB] worker exited with code ${code} (signal: ${signal})`);
     });
 
@@ -933,7 +1007,9 @@ export class FsdbFormatHandler implements WaveformFileParser {
               msgCount++;
               if (_dwf && msgCount <= 5) { log(`[WF:stdio:rx#${msgCount}] command=${msg.command ?? '(response)'} id=${msg.id ?? '(none)'}`); }
               if (_dwf && msgCount === 6) { log('[WF:stdio:rx] (further messages suppressed)'); }
-              this.handleMessage(msg);
+              if ('command' in msg) {
+                this.handleMessage(msg);
+              }
               // Also notify callFsdbWorkerTask listeners
               for (const listener of this.stdioMessageListeners) {
                 listener(msg);
@@ -956,16 +1032,20 @@ export class FsdbFormatHandler implements WaveformFileParser {
         log('[FSDB] worker is online.');
       });
       this.fsdbWorker.on('message', (msg: any) => {
-        this.handleMessage(msg);
+        if ('command' in msg) {
+          this.handleMessage(msg);
+        }
+        // Responses with 'id' are handled by callFsdbWorkerTask listeners
       });
     }
   }
 
-  private handleMessage(message: any) {
+  private handleMessage(message: FsdbWorkerCallback) {
     switch (message.command) {
       case 'require-failed': {
         this.providerDelegate.logOutputChannel(`[FSDB] require-failed: ${JSON.stringify(message.error)}`);
-        vscode.window.showErrorMessage("Failed to load FSDB reader, is vaporview.fsdbReaderLibsPath properly set? (" + message.error.code + ")");
+        const errorCode = message.error?.code ?? 'unknown';
+        vscode.window.showErrorMessage("Failed to load FSDB reader, is vaporview.fsdbReaderLibsPath properly set? (" + errorCode + ")");
         break;
       }
       case 'fsdb-scope-callback': {
@@ -1031,7 +1111,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
             if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] response for ${message.command} id=${id} elapsed=${Date.now() - taskStartTime}ms`); }
             if (msg.error) {
               if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${msg.error}`); }
-              return reject(new Error(msg.error));
+              return reject(new Error(String(msg.error)));
             }
             resolve(msg);
           }
@@ -1042,15 +1122,15 @@ export class FsdbFormatHandler implements WaveformFileParser {
         this.fsdbWorker!.stdin!.write(payload);
       } else {
         // IPC mode (fork): use built-in message channel
-        const messageHandler = (message: any) => {
-          if (message.id === id) {
+        const messageHandler = (msg: any) => {
+          if ('id' in msg && msg.id === id) {
             this.fsdbWorker!.off('message', messageHandler);
             if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] IPC response id=${id} elapsed=${Date.now() - taskStartTime}ms`); }
-            if (message.error) {
-              if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${message.error}`); }
-              return reject(new Error(message.error));
+            if (msg.error) {
+              if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${msg.error}`); }
+              return reject(new Error(String(msg.error)));
             }
-            resolve(message);
+            resolve(msg);
           }
         };
         this.fsdbWorker!.on('message', messageHandler);
@@ -1102,7 +1182,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
         command: 'getValueChanges',
         signalId: signalId
       });
-      const message = result as FsdbWorkerMessage;
+      const message = result;
       const data = message.result as FsdbWaveformData;
 
       this.postMessageToWebview({
@@ -1122,8 +1202,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
   async getValueChangesForSignal(signalId: SignalId): Promise<any> {
     await this.callFsdbWorkerTask({ command: 'loadSignals', signalIdList: [signalId] });
     const result = await this.callFsdbWorkerTask({ command: 'getValueChanges', signalId: signalId });
-    const message = result as FsdbWorkerMessage;
-    return (message.result as FsdbWaveformData);
+    return (result.result as FsdbWaveformData);
   }
 
   async getEnumData(enumList: EnumQueueEntry[]): Promise<void> {
@@ -1132,9 +1211,9 @@ export class FsdbFormatHandler implements WaveformFileParser {
     return;
   }
 
-  async getValuesAtTime(time: number, instancePaths: string[]): Promise<any> {
+  async getValuesAtTime(time: number, instancePaths: string[]): Promise<ValuesAtTimeResult[]> {
     const instancePath2signalId: Map<string, number> = new Map();
-    const signalId2values: Map<number, any> = new Map();
+    const signalId2values: Map<number, string | string[]> = new Map();
     for (const instancePath of instancePaths) {
       const netlistItem = await this.findTreeItemFn(instancePath, undefined, undefined);
       if (netlistItem) {
@@ -1159,8 +1238,8 @@ export class FsdbFormatHandler implements WaveformFileParser {
         signalId: signalId,
         time: time
       });
-      const message = result as FsdbWorkerMessage;
-      signalId2values.set(signalId, message.result);
+      const message = result;
+      signalId2values.set(signalId, (message.result as string | string[]) ?? '');
     }));
 
     // Convert the map to an array of objects
@@ -1190,8 +1269,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
       command: 'getVarInfo',
       signalId: signalId
     });
-    const message = result as FsdbWorkerMessage;
-    return message.result;
+    return result.result;
   }
 
   async unload(): Promise<void> {

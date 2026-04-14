@@ -1,6 +1,26 @@
 # Change Log
 
-## 1.5.1 - 3/9/2026 - Latest Release
+## 1.5.3
+
+- Shift + Up/Down Arrow now adds to selection
+- Enforce type safety @AndrewNolte
+
+## 1.5.2 - 4/8/2026 - Latest Release
+
+- Waveform color palette is derived from semantic token colors to better align with color theme
+- Added time units to save files
+- Viewer will show missing signals from save files not found in netlist
+- Clicking on an area outside the waveforms de-selects signals
+- Left/Right arrow no longer moves the marker if rows with no value change data are selected
+- Organized user settings into categories
+- Added user settings for default waveform colors
+- Added Epoch time (ns) number format
+- Netlist search better displays variable or scope name and instance path @DGGua
+- Multi-bit renderer at larger row heights now only vertically scales
+- Fixed status bar not updating when setting alt marker, or selecting the last value change
+- Update wellen to 0.20.4
+
+## 1.5.1 - 3/9/2026
 
 - Added Netlist search functionality to search by instance path
 - Added Zoom animations for highlight zoom (configurable in settings)
