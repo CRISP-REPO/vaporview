@@ -208,7 +208,7 @@ export interface NetlistTreeItemData {
   children: NetlistTreeItemData[];
   tooltip?: string | MarkdownString;
   contextValue?: string;
-  iconPath?: string | Uri | ThemeIcon | { light: Uri; dark: Uri };
+  iconPath?: string | Uri | ThemeIcon | { light: string | Uri; dark: string | Uri };
 }
 
 // #region Webview Context Types
