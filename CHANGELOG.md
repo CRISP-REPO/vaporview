@@ -1,11 +1,29 @@
 # Change Log
 
-## 1.5.3
+## 1.5.4
+
+- Floating/detached tabs now work properly
+- Added drag and drop support for .json viewer settings files
+
+## 1.5.3 - 5/20/2026 - Latest Release
 
 - Shift + Up/Down Arrow now adds to selection
+- Glitch transitions show all values in value display
+- Added feature to modify time ruler increment
+- Value Links have been converted from a command call to an event emitter
+- Added user settings:
+  - Default "Auto Reload" state
+  - Touchpad pinch zoom sensitivity
+  - Custom fallback colors for colors 5-8
+- Fixed:
+  - Horizontal scrollbar drag behavior
+  - Number formatting reset in missing signals when re-saving
+  - Waveform disappearing when highlight zoom
+  - Netlist sorting (when enabled) is numerical aware @shlyahtink
 - Enforce type safety @AndrewNolte
+- Update wellen to 0.20.5
 
-## 1.5.2 - 4/8/2026 - Latest Release
+## 1.5.2 - 4/8/2026
 
 - Waveform color palette is derived from semantic token colors to better align with color theme
 - Added time units to save files

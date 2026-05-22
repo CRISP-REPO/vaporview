@@ -1,4 +1,4 @@
-import { type NetlistId, SignalId, type RowId, StateChangeType, type DocumentId, SavedNetlistVariable, SavedSignalSeparator, SavedSignalGroup, CollapseState, SavedCustomVariable, DefaultWebviewContext, SavedRowItem, InitMessage } from '../common/types';
+import { type NetlistId, SignalId, type RowId, StateChangeType, type DocumentId, SavedNetlistVariable, SavedSignalSeparator, SavedSignalGroup, CollapseState, SavedCustomVariable, DefaultWebviewContext, SavedRowItem, InitMessage, WebviewStateEvent } from '../common/types';
 import { ActionType, EventHandler } from './event_handler';
 import { Viewport } from './viewport';
 import { LabelsPanels } from './labels';
@@ -178,7 +178,7 @@ export function getRowHeightCssClass(height: number) {
 // Event handler helper functions
 // ----------------------------------------------------------------------------
 
-export function createWebviewContext() {
+export function createWebviewContext(): WebviewStateEvent {
   let selectedNetlistId: number | null = null;
   if (viewerState.selectedSignal.length === 1) {
     const data = rowHandler.rowItems[viewerState.selectedSignal[0]];
@@ -196,13 +196,14 @@ export function createWebviewContext() {
   });
 
   return {
-    markerTime: viewerState.markerTime,
-    altMarkerTime: viewerState.altMarkerTime,
+    markerTime: viewerState.markerTime ?? undefined,
+    altMarkerTime: viewerState.altMarkerTime ?? undefined,
     displayTimeUnit: viewport.displayTimeUnit,
     selectedSignal: selectedNetlistId,
     selectedSignalCount: viewerState.selectedSignal.length,
     transitionCount: dataManager.getTransitionCount(),
     zoomRatio: vaporview.viewport.zoomRatio,
+    defaultPixelTime: viewport.defaultPixelTime * 100,
     scrollLeft: Math.round(vaporview.viewport.timeScrollLeft),
     autoReload: viewerState.autoReload,
     displayedSignals: signalList,
@@ -314,7 +315,7 @@ class VaporviewWebview {
 
     const deltaY = e.deltaY;
     const deltaX = e.deltaX;
-    const touchpadScrollDivisor = 18;
+    const touchpadPinchDivider = 18 / config.touchpadPinchSensitivity;
     const mouseMode = !config.autoTouchpadScrolling && !config.touchpadScrolling;
 
     if (e.shiftKey) {
@@ -329,7 +330,7 @@ class VaporviewWebview {
       const bounds      = viewport.scrollAreaBounds;
       const pixelLeft   = Math.round(e.pageX - bounds.left);
       const time        = Math.round((pixelLeft + this.viewport.pseudoScrollLeft) * this.viewport.pixelTime);
-      const zoomOffset  = Math.min(touchpadScrollDivisor, Math.max(-touchpadScrollDivisor, deltaY));
+      const zoomOffset  = Math.min(touchpadPinchDivider, Math.max(-touchpadPinchDivider, deltaY));
 
       //if (deltaY !== zoomOffset) {console.log('deltaY: ' + deltaY + '; zoomOffset: ' + zoomOffset);}
       // scroll up zooms in (- deltaY), scroll down zooms out (+ deltaY)
@@ -338,7 +339,7 @@ class VaporviewWebview {
 
       // Handle zooming with touchpad since we apply scroll attenuation
       else {
-        viewport.handleZoom(zoomOffset / touchpadScrollDivisor, time, pixelLeft);
+        viewport.handleZoom(zoomOffset / touchpadPinchDivider, time, pixelLeft);
       }
 
     } else {
@@ -603,7 +604,9 @@ export function init(message: InitMessage) {
   styles.getThemeColors();
   styles.updateColorPalette(message.colorPalette, message.errorColorPalette, message.themeValid);
   viewport.initViewport(message.metadata);
+  controlBar.setAutoReload(message.autoReload);
   vscodeWrapper.restoreState();
+  vscodeWrapper.setInitComplete();
   //this.updateRuler();
   //this.updatePending = false;
 }

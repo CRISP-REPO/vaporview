@@ -123,10 +123,9 @@ export class FsdbFormatHandler implements WaveformFileParser {
     signalIdCount: 0,
     timeTableCount: 0,
     timeEnd: 0,
-    defaultZoom: 1,
+    minTimeStep: 1,
     timeScale: 1,
     timeUnit: "ns",
-    chunkSize: 1
   };
 
   constructor(
@@ -1071,7 +1070,6 @@ export class FsdbFormatHandler implements WaveformFileParser {
         this.metadata.timeEnd = Number(message.timeend);
         this.metadata.timeTableCount = 0; // FSDB addon does not provide timeTableCount
         this.metadata.timeTableLoaded = true;
-        this.metadata.chunkSize = Number(message.chunksize);
         break;
       }
       case 'fsdb-var-callback': {

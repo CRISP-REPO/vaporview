@@ -6,6 +6,7 @@ import { type WaveformRenderer, setRenderBounds } from "./renderer";
 import type { WaveformData } from "./data_manager";
 import { labelsPanel } from "./vaporview";
 import { createInstancePath } from '../common/functions';
+import { ValueLinkEvent } from '../../packages/vaporview-api/types';
 
 export function htmlSafe(string: string) {
   return string.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -21,6 +22,8 @@ export function isAnalogSignal(renderType: WaveformRenderer) {
 }
 
 function mouseOverHandler(event: MouseEvent, signalItem: NetlistVariable, checkBounds: boolean) {
+
+  if (!signalItem.valueLinkEnable) {return;}
   if (!event.target) {return;}
 
   let redraw        = false;
@@ -44,9 +47,9 @@ function mouseOverHandler(event: MouseEvent, signalItem: NetlistVariable, checkB
 
   // Check to change cursor to a pointer
   if (valueIndex >= 0 && (event.ctrlKey || event.metaKey)) {
-    signalItem.canvas?.classList.add('waveform-link');
+    viewport.overlayCanvasElement.classList.add('waveform-link');
   } else {
-    signalItem.canvas?.classList.remove('waveform-link');
+    viewport.overlayCanvasElement.classList.remove('waveform-link');
   }
 
   if (valueIndex !== signalItem.valueLinkIndex) {redraw = true;}
@@ -127,7 +130,7 @@ export interface RowItem {
 export class SignalSeparator extends SignalItem implements RowItem {
 
   constructor(
-    public rowId: number,
+    public readonly rowId: number,
     public label: string,
   ) {
     super();
@@ -189,7 +192,7 @@ export class SignalSeparator extends SignalItem implements RowItem {
 export class NetlistVariable extends SignalItem implements RowItem {
 
   public valueFormat: ValueFormat;
-  public valueLinkCommand: string = "";
+  public valueLinkEnable: boolean = false;
   public valueLinkBounds: [number, number][] = [];
   public valueLinkIndex: number = -1;
   public colorIndex: number = 0;
@@ -203,16 +206,17 @@ export class NetlistVariable extends SignalItem implements RowItem {
   public customName: string = "";
   public min: number = 0;
   public max: number = 0;
+  public readonly missingSignal: boolean;
 
   constructor(
     public readonly rowId: RowId,
     public readonly netlistId: number | undefined,
-    public signalId: number | undefined,
-    public signalName: string,
-    public scopePath: string[],
-    public signalWidth: number,
-    public variableType: string,
-    public encoding: VariableEncoding,
+    public readonly signalId: number | undefined,
+    public readonly signalName: string,
+    public readonly scopePath: string[],
+    public readonly signalWidth: number,
+    public readonly variableType: string,
+    public readonly encoding: VariableEncoding,
     public renderType: WaveformRenderer,
     public enumType: string,
   ) {
@@ -225,6 +229,12 @@ export class NetlistVariable extends SignalItem implements RowItem {
       this.colorIndex = config.defaultSingleBitColor;
     } else {
       this.colorIndex = config.defaultMultiBitColor;
+    }
+
+    if (this.signalId === undefined && this.netlistId === undefined) {
+      this.missingSignal = true;
+    } else {
+      this.missingSignal = false;
     }
 
     if (this.encoding === VariableEncoding.String) {
@@ -266,7 +276,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
   public createLabelElement() {
 
     let missingSignalClass = "";
-    if (this.signalId === undefined) {missingSignalClass = 'missing-signal';}
+    if (this.missingSignal) {missingSignalClass = 'missing-signal';}
     const height        = getRowHeightCssClass(this.rowHeight);
     const signalName    = htmlSafe(this.signalName);
     const instancePath  = htmlSafe(createInstancePath(this.scopePath, signalName));
@@ -282,7 +292,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
 
   public createValueDisplayElement() {
     let   value = labelsPanel.valueAtMarker[this.rowId];
-    if (value === undefined || this.signalId === undefined) {value = [];}
+    if (this.missingSignal || value === undefined) {value = [];}
     const isSelectedClass   = this.isSelected ? 'is-selected' : '';
     const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
     const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
@@ -329,7 +339,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
       type: this.variableType,
       width: this.signalWidth,
       preventDefaultContextMenuItems: true,
-      commandValid: this.valueLinkCommand !== "",
+      valueLinkEnable: this.valueLinkEnable,
       netlistId: this.netlistId!,
       rowId: this.rowId,
       isAnalog: isAnalog,
@@ -350,7 +360,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
       nameType:         this.nameType,
       customName:       this.customName,
       renderType:       this.renderType.id,
-      valueLinkCommand: this.valueLinkCommand
+      valueLinkEnable:  this.valueLinkEnable
     };
   }
 
@@ -440,12 +450,11 @@ export class NetlistVariable extends SignalItem implements RowItem {
     const data = dataManager.valueChangeData[this.signalId];
 
     if (!data) {return false;}
-    if (this.valueLinkCommand === "") {return false;}
+    if (!this.valueLinkEnable) {return false;}
     if (this.renderType.id !== 'multiBit') {return false;}
     if (this.valueLinkIndex < 0) {return false;}
     if (time !== snapToTime) {return false;}
 
-    const command        = this.valueLinkCommand;
     const signalId       = this.signalId;
     const index          = dataManager.binarySearch(data.valueChangeData, time) - 1;
     const valueChange    = dataManager.valueChangeData[signalId].valueChangeData[index];
@@ -453,7 +462,9 @@ export class NetlistVariable extends SignalItem implements RowItem {
     const value          = valueChange[1];
     const formattedValue = this.valueFormat.formatString(value, this.signalWidth, !this.valueFormat.is9State(value));
 
-    const event = {
+    const event: ValueLinkEvent = {
+      uri: viewerState.uri?.toString() || "",
+      rowId: this.rowId,
       netlistId: this.netlistId,
       scopePath: this.scopePath,
       signalName: this.signalName,
@@ -466,7 +477,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
       time: timeValue,
     };
 
-    vscodeWrapper.executeCommand(command, [event]);
+    vscodeWrapper.emitValueLinkEvent(event);
     return true;
   }
 
@@ -483,7 +494,7 @@ export class NetlistVariable extends SignalItem implements RowItem {
 export class CustomVariable extends SignalItem implements RowItem {
 
   public valueFormat: ValueFormat;
-  public valueLinkCommand: string = "";
+  public valueLinkEnable: boolean = false;
   public valueLinkBounds: [number, number][] = [];
   public valueLinkIndex: number = -1;
   public colorIndex: number = config.defaultCustomSignalColor;
@@ -497,14 +508,15 @@ export class CustomVariable extends SignalItem implements RowItem {
   public customName: string = "";
   public min: number = 0;
   public max: number = 0;
-  public variableType: string = "custom";
+  public readonly variableType: string = "custom";
   public encoding: VariableEncoding = VariableEncoding.BitVector;
   public enumType: string = "";
+  public readonly missingSignal: boolean;
 
   constructor(
-    public rowId: number,
+    public readonly rowId: number,
     public source: BitRangeSource[],
-    public customSignalId: number | undefined,
+    public readonly customSignalId: number | undefined,
     public signalName: string,
     public signalWidth: number,
     public renderType: WaveformRenderer,
@@ -512,6 +524,7 @@ export class CustomVariable extends SignalItem implements RowItem {
     super();
     this.customName = this.signalName;
     this.valueFormat = this.signalWidth === 1 ? formatBinary : formatHex;
+    this.missingSignal = (this.customSignalId === undefined);
     this.setSignalContextAttribute();
     this.setColorFromColorIndex();
   }
@@ -528,7 +541,7 @@ export class CustomVariable extends SignalItem implements RowItem {
   public createLabelElement() {
 
     let missingSignalClass = "";
-    if (this.customSignalId === undefined) {missingSignalClass = 'missing-signal';}
+    if (this.missingSignal) {missingSignalClass = 'missing-signal';}
     const height        = getRowHeightCssClass(this.rowHeight);
     const signalName    = htmlSafe(this.signalName);
     const isSelectedClass   = this.isSelected ? 'is-selected' : '';
@@ -543,7 +556,7 @@ export class CustomVariable extends SignalItem implements RowItem {
     public createValueDisplayElement() {
 
       let   value = labelsPanel.valueAtMarker[this.rowId];
-      if (value === undefined || this.customSignalId === undefined) {value = [];}
+      if (this.missingSignal || value === undefined) {value = [];}
       const isSelectedClass   = this.isSelected ? 'is-selected' : '';
       const lastSelectedClass = viewerState.lastSelectedSignal === this.rowId ? 'last-selected' : '';
       const selectorClass = isSelectedClass + ' ' + lastSelectedClass;
@@ -606,7 +619,7 @@ export class CustomVariable extends SignalItem implements RowItem {
       nameType:         this.nameType,
       customName:       this.customName,
       renderType:       this.renderType.id,
-      valueLinkCommand: this.valueLinkCommand,
+      valueLinkEnable:  this.valueLinkEnable,
     };
   }
 
@@ -709,7 +722,7 @@ export class SignalGroup extends SignalItem implements RowItem {
   public children: RowId[] = [];
 
   constructor(
-    public rowId: number,
+    public readonly rowId: number,
     public label: string,
     public readonly groupId: number
   ) {

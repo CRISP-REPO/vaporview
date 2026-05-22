@@ -8,7 +8,7 @@
     "color": "#202020",
     "theme": "dark"
   },
-  "version": "1.5.2",
+  "version": "1.5.3",
   "repository": "https://github.com/lramseyer/vaporview",
   "categories": [
     "Debuggers",
@@ -130,20 +130,6 @@
       {
         "title": "General",
         "properties": {
-          "vaporview.enableAnimations": {
-            "type": "boolean",
-            "default": true,
-            "scope": "application",
-            "description": "Enable animations for the waveform viewer."
-          },
-          "vaporview.animationDuration": {
-            "type": "number",
-            "default": 50,
-            "minimum": 5,
-            "maximum": 500,
-            "scope": "application",
-            "description": "Animation duration in milliseconds."
-          },
           "vaporview.enableInstancePathTerminalLinks": {
             "type": "boolean",
             "default": true,
@@ -160,6 +146,14 @@
             "default": "Mouse",
             "scope": "application",
             "description": "Scrolling mode for the waveform viewer. Options: 'mouse' (default), 'touch'."
+          },
+          "vaporview.touchpadPinchSensitivity": {
+            "type": "number",
+            "default": 1,
+            "scope": "application",
+            "minimum": 0.1,
+            "maximum": 10,
+            "description": "Touchpad pinch zoom sensitivity - Higher values Zoom faster."
           },
           "vaporview.sortNetlist": {
             "type": "boolean",
@@ -183,6 +177,12 @@
       {
         "title": "File Loading",
         "properties": {
+          "vaporview.defaultAutoReload": {
+            "type": "boolean",
+            "default": false,
+            "scope": "application",
+            "description": "Recommended: false (unchecked) - default state for the 'Auto Reload' checkbox in the control bar. When enabled, files opened will have auto reload enabled by default."
+          },
           "vaporview.fstMaxStaticLoadSize": {
             "type": "number",
             "default": 256,
@@ -216,24 +216,28 @@
         "title": "Styles",
         "properties": {
           "vaporview.showRulerLines": {
+            "order": 1,
             "type": "boolean",
             "default": "true",
             "scope": "application",
             "description": "Vertical ruler lines in the waveform viewer."
           },
           "vaporview.fillMultiBitValues": {
+            "order": 2,
             "type": "boolean",
             "default": "false",
             "scope": "application",
             "description": "Multi-bit renderer style - If checked, fills the value box with color. If unchecked, only the outline is drawn."
           },
           "vaporview.multiBitFixedHeight": {
+            "order": 3,
             "type": "boolean",
             "default": "true",
             "scope": "application",
             "description": "Bit vector renderer style - If checked, multi-bit signals are drawn with a fixed height. If unchecked, short transitions are drawn with a smaller height."
           },
           "vaporview.defaultSingleBitColor": {
+            "order": 4,
             "type": "number",
             "default": 1,
             "minimum": 1,
@@ -242,6 +246,7 @@
             "description": "Default waveform color for single bit signals."
           },
           "vaporview.defaultMultiBitColor": {
+            "order": 5,
             "type": "number",
             "default": 1,
             "minimum": 1,
@@ -250,6 +255,7 @@
             "description": "Default waveform color for multi bit signals."
           },
           "vaporview.defaultParamColor": {
+            "order": 6,
             "type": "number",
             "default": 3,
             "minimum": 1,
@@ -258,6 +264,7 @@
             "description": "Default waveform color for parameters."
           },
           "vaporview.defaultStringColor": {
+            "order": 7,
             "type": "number",
             "default": 2,
             "minimum": 1,
@@ -266,6 +273,7 @@
             "description": "Default waveform color for strings."
           },
           "vaporview.defaultEnumColor": {
+            "order": 8,
             "type": "number",
             "default": 1,
             "minimum": 1,
@@ -274,25 +282,72 @@
             "description": "Default waveform color for enums."
           },
           "vaporview.defaultCustomSignalColor": {
+            "order": 9,
             "type": "number",
             "default": 1,
             "minimum": 1,
             "maximum": 8,
             "scope": "application",
             "description": "Default waveform color for custom signals."
+          },
+          "vaporview.customColor5": {
+            "order": 10,
+            "type": "string",
+            "scope": "application",
+            "default": "#ffa557",
+            "description": "Fallback color for Color 5, must be a valid color name."
+          },
+          "vaporview.customColor6": {
+            "order": 11,
+            "type": "string",
+            "scope": "application",
+            "default": "#dcdcaa",
+            "description": "Fallback color for Color 6, must be a valid color name."
+          },
+          "vaporview.customColor7": {
+            "order": 12,
+              "type": "string",
+            "scope": "application",
+            "default": "#d2a8ff",
+            "description": "Fallback color for Color 7, must be a valid color name."
+          },
+          "vaporview.customColor8": {
+            "order": 13,
+            "type": "string",
+            "scope": "application",
+            "default": "#4abfa8",
+            "description": "Fallback color for Color 8, must be a valid color name."
           }
         }
       },
       {
         "title": "Performance",
         "properties": {
+          "vaporview.enableAnimations": {
+            "order": 1,
+            "type": "boolean",
+            "default": true,
+            "scope": "application",
+            "description": "Enable animations for the waveform viewer."
+          },
+          "vaporview.animationDuration": {
+            "order": 2,
+            "type": "number",
+            "default": 50,
+            "minimum": 5,
+            "maximum": 500,
+            "scope": "application",
+            "description": "Animation duration in milliseconds."
+          },
           "vaporview.overrideDevicePixelRatio": {
+            "order": 3,
             "type": "boolean",
             "default": false,
             "scope": "application",
             "description": "Recommended: false (unchecked) - Override the device pixel ratio for the waveform viewer. This can be used to improve performance on high-DPI displays, or correct for incorrect device pixel ratio detection."
           },
           "vaporview.userPixelRatio": {
+            "order": 4,
             "type": "number",
             "default": 1,
             "minimum": 0.1,
@@ -301,6 +356,7 @@
             "description": "Device pixel ratio for the waveform viewer. This is only used if 'Override Device Pixel Ratio' is enabled."
           },
           "vaporview.disableAnalogRendererOptimizations": {
+            "order": 5,
             "type": "boolean",
             "default": false,
             "scope": "application",
@@ -463,6 +519,11 @@
         "when": "activeCustomEditorId == 'vaporview.waveformViewer'"
       },
       {
+        "id": "vaporview.rulerTimeIncrement",
+        "label": "Ruler Time Increment",
+        "when": "activeCustomEditorId == 'vaporview.waveformViewer'"
+      },
+      {
         "id": "vaporview.scrollMode",
         "label": "Scrolling Mode",
         "when": "activeCustomEditorId == 'vaporview.waveformViewer'"
@@ -560,47 +621,51 @@
       "webview/context": [
         {
           "submenu": "vaporview.timeUnit",
-          "group": "1_default@1"
+          "group": "1_time_ruler@1"
+        },
+        {
+          "submenu": "vaporview.rulerTimeIncrement",
+          "group": "1_time_ruler@2"
         },
         {
           "submenu": "vaporview.scrollMode",
           "when": "webviewSection == 'ruler' && activeCustomEditorId == 'vaporview.waveformViewer'",
-          "group": "1_default@2"
+          "group": "1_time_ruler@3"
         },
         {
           "command": "vaporview.showRulerLines",
           "when": "webviewSection == 'ruler' && rulerLines == false && activeCustomEditorId == 'vaporview.waveformViewer'",
-          "group": "1_default@3"
+          "group": "3_general_settings@1"
         },
         {
           "command": "vaporview.hideRulerLines",
           "when": "webviewSection == 'ruler' && rulerLines == true && activeCustomEditorId == 'vaporview.waveformViewer'",
-          "group": "1_default@3"
+          "group": "3_general_settings@1"
         },
         {
           "command": "vaporview.fillBitVector",
           "when": "webviewSection == 'ruler' && fillBitVector == false && activeCustomEditorId == 'vaporview.waveformViewer'",
-          "group": "1_default@4"
+          "group": "3_general_settings@2"
         },
         {
           "command": "vaporview.outlineBitVector",
           "when": "webviewSection == 'ruler' && fillBitVector == true && activeCustomEditorId == 'vaporview.waveformViewer'",
-          "group": "1_default@4"
+          "group": "3_general_settings@2"
         },
         {
           "command": "vaporview.enableAnimations",
           "when": "webviewSection == 'ruler' && activeCustomEditorId == 'vaporview.waveformViewer' && enableAnimations == false",
-          "group": "1_default@5"
+          "group": "3_general_settings@3"
         },
         {
           "command": "vaporview.disableAnimations",
           "when": "webviewSection == 'ruler' && activeCustomEditorId == 'vaporview.waveformViewer' && enableAnimations == true",
-          "group": "1_default@5"
+          "group": "3_general_settings@3"
         },
         {
           "command": "vaporview.viewVaporViewSettings",
           "when": "webviewSection == 'ruler' && activeCustomEditorId == 'vaporview.waveformViewer'",
-          "group": "1_default@6"
+          "group": "3_general_settings@4"
         },
         {
           "submenu": "vaporview.valueFormat",
@@ -948,6 +1013,18 @@
           "command": "vaporview.setTimeUnitsFemtoseconds",
           "when": "fs == true",
           "group": "1_default@6"
+        }
+      ],
+      "vaporview.rulerTimeIncrement": [
+        {
+          "command": "vaporview.autoRulerTimeIncrement",
+          "when": "webviewSection == 'ruler'",
+          "group": "1_default@1"
+        },
+        {
+          "command": "vaporview.setRulerTimeIncrement",
+          "when": "webviewSection == 'ruler'",
+          "group": "1_default@2"
         }
       ],
       "vaporview.scrollMode": [
@@ -1375,6 +1452,14 @@
       {
         "command": "vaporview.hideRulerLines",
         "title": "Hide Ruler Lines"
+      },
+      {
+        "command": "vaporview.setRulerTimeIncrement",
+        "title": "Custom..."
+      },
+      {
+        "command": "vaporview.autoRulerTimeIncrement",
+        "title": "Auto"
       },
       {
         "command": "vaporview.fillBitVector",

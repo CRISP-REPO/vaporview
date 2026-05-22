@@ -1,13 +1,12 @@
 import * as vscode from 'vscode';
-import { type SignalId, type NetlistId, StateChangeType, type QueueEntry, type EnumQueueEntry, type DocumentId, type SavedRowItem, VariableEncoding, type BitRangeSource, type AddVariableSignal, InitMessage, WaveformDumpMetadata, ConfigSettingsMessage } from '../common/types';
-import type { GetValuesAtTimeArgs, ValuesAtTimeResult } from '../../packages/vaporview-api/types';
+import { type SignalId, type NetlistId, StateChangeType, type QueueEntry, type EnumQueueEntry, type DocumentId, type SavedRowItem, VariableEncoding, type BitRangeSource, type AddVariableSignal, InitMessage, WaveformDumpMetadata, ConfigSettingsMessage, EmitEventMessage, type WebviewStateEvent } from '../common/types';
+import type { GetValuesAtTimeArgs, SignalEvent, ValuesAtTimeResult } from '../../packages/vaporview-api/types';
 import { bitRangeString, logScaleFromUnits, parseParamValue, toStringWithCommas } from '../common/functions';
 import { NetlistLinkProvider } from './terminal_links';
 import * as path from 'path';
 import type { VaporviewDocumentCollection, VaporviewDocumentDelegate } from './viewer_provider';
 import { getVarIcon, getScopeIcon, type NetlistItem } from './tree_view';
 import type { FsdbFormatHandler } from './fsdb_handler';
-
 
 export type NetlistIdTable = NetlistItem[];
 
@@ -50,30 +49,31 @@ export type CustomVariableParseResult = {
   missingSignals: string[];
 };
 
+// TODO: Combine with WebviewStateEvent in /common/types.ts and WebviewState class
 export type WebviewStateSettings = {
-  displayedSignals?: SavedRowItem[] | ParsedSignalData[];
+  extensionVersion: string | undefined;
   markerTime?: number | null;
   altMarkerTime?: number | null;
   displayTimeUnit?: string;
   selectedSignal?: { name: string; msb: number; lsb: number } | null;
   zoomRatio?: number;
   scrollLeft?: number;
+  defaultPixelTime?: number;
   autoReload?: boolean;
+  displayedSignals?: SavedRowItem[] | ParsedSignalData[];
 };
 
-export type WebviewStateEvent = {
-  stateChangeType?: StateChangeType;
-  markerTime?: number;
-  altMarkerTime?: number;
-  displayTimeUnit?: string;
-  selectedSignal?: NetlistId | null;
-  displayedSignals?: SavedRowItem[];
-  zoomRatio?: number;
-  scrollLeft?: number;
-  autoReload?: boolean;
-  transitionCount?: number | null;
-  selectedSignalCount?: number;
-};
+class WebviewState {
+  markerTime: number | null = null;
+  altMarkerTime: number | null = null;
+  displayTimeUnit: string = "ns";
+  selectedSignal: NetlistId | null = null;
+  zoomRatio: number = 1;
+  scrollLeft: number = 0;
+  defaultPixelTime: number = 1;
+  autoReload: boolean = false;
+  displayedSignals: SavedRowItem[] = [];
+}
 
 /* 
 Interface for waveform file parsers
@@ -98,17 +98,6 @@ export interface WaveformFileParser {
 
   // Callbacks
   postMessageToWebview(message: Record<string, unknown>): void;
-}
-
-class WebviewState {
-  markerTime: number | null = null;
-  altMarkerTime: number | null = null;
-  selectedSignal: NetlistId | null = null;
-  displayTimeUnit: string = "ns";
-  zoomRatio: number = 1;
-  scrollLeft: number = 0;
-  autoReload: boolean = false;
-  displayedSignals: SavedRowItem[] = [];
 }
 
 // #region VaporviewDocument
@@ -176,15 +165,6 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   //public get handler(): WaveformFileParser { return this._handler; }
   public get providerDelegate(): VaporviewDocumentDelegate { return this._providerDelegate; }
 
-  // #region WaveformFileParserDelegate implementation
-  // These methods are called by the format handlers
-  public setChunkSize() {
-    const chunkSize = this.metadata.chunkSize;
-    const newMinTimeStep = 10 ** (Math.round(Math.log10(Number(chunkSize) / 128)) | 0);
-    this.metadata.defaultZoom = 4 / newMinTimeStep;
-    this.onDoneParsingWaveforms();
-  }
-
   public postMessageToWebview(message: Record<string, unknown>): void {
     this.webviewPanel?.webview.postMessage(message);
   }
@@ -210,7 +190,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     const bodyLoadTime = Date.now();
     await this._handler.loadBody();
     const bodyTime     = (Date.now() - bodyLoadTime) / 1000;
-    this.setChunkSize();
+    this.onDoneParsingWaveforms();
 
     const timeTableCount = toStringWithCommas(Number(this.metadata.timeTableCount));
     this._providerDelegate.logOutputChannel("Finished parsing body for " + this.uri.fsPath);
@@ -225,9 +205,10 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   public onWebviewReady(webviewPanel: vscode.WebviewPanel) {
     this.webviewPanel = webviewPanel;
     this._handler.postMessageToWebview = webviewPanel.webview.postMessage.bind(webviewPanel.webview);
-    if (this._webviewInitialized) { return; }
+    //if (this._webviewInitialized) { return; }
     if (!this.metadata.timeTableLoaded) { return; }
     const colorPalette = this._providerDelegate.getColorPalette();
+    this.setConfigurationSettings();
     webviewPanel.webview.postMessage({
       command: 'initViewport',
       metadata: this.metadata,
@@ -236,17 +217,23 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       colorPalette: colorPalette.colorPalette,
       errorColorPalette: colorPalette.errorColorPalette,
       themeValid: colorPalette.themeValid,
+      autoReload: this.webviewContext.autoReload,
     } as InitMessage);
-    this.setConfigurationSettings();
     this._webviewInitialized = true;
   }
 
   public setConfigurationSettings() {
     const config = vscode.workspace.getConfiguration('vaporview');
 
+    const customColor5 = config.get('customColor5');
+    const customColor6 = config.get('customColor6');
+    const customColor7 = config.get('customColor7');
+    const customColor8 = config.get('customColor8');
+
     this.webviewPanel?.webview.postMessage({
       command: 'setConfigSettings',
       scrollingMode:                      config.get('scrollingMode'),
+      touchpadPinchSensitivity:           config.get('touchpadPinchSensitivity'),
       rulerLines:                         config.get('showRulerLines'),
       overrideDevicePixelRatio:           config.get('overrideDevicePixelRatio'),
       userPixelRatio:                     config.get('userPixelRatio'),
@@ -261,6 +248,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       defaultStringColor:                 config.get('defaultStringColor'),
       defaultEnumColor:                   config.get('defaultEnumColor'),
       defaultCustomSignalColor:           config.get('defaultCustomSignalColor'),
+      customColorPalette:                 [customColor5, customColor6, customColor7, customColor8],
     } as ConfigSettingsMessage);
 
     this.setTerminalLinkProvider();
@@ -304,6 +292,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     this.webviewContext.displayedSignals = event.displayedSignals || this.webviewContext.displayedSignals;
     this.webviewContext.zoomRatio        = event.zoomRatio        || this.webviewContext.zoomRatio;
     this.webviewContext.scrollLeft       = event.scrollLeft       || this.webviewContext.scrollLeft;
+    this.webviewContext.defaultPixelTime = event.defaultPixelTime || this.webviewContext.defaultPixelTime;
     this.webviewContext.autoReload       = event.autoReload       || this.webviewContext.autoReload;
 
     return isDirty;
@@ -319,8 +308,9 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       selectedSignal: this.getNameFromNetlistId(this.webviewContext.selectedSignal),
       zoomRatio: this.webviewContext.zoomRatio,
       scrollLeft: this.webviewContext.scrollLeft,
+      defaultPixelTime: this.webviewContext.defaultPixelTime,
       displayedSignals: this.webviewContext.displayedSignals
-    };
+    } as WebviewStateSettings;
   }
 
   public async getNetlistItemFromSignalInfo(signalInfo: SignalInfo | SignalInfoSource, useNetlistId: boolean): Promise<NetlistItem | null> {
@@ -446,6 +436,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     const signalListSettings = await this.convertSignalListToSettings((settings.displayedSignals || []) as unknown as SignalInfo[], useNetlistId);
     //console.log('signalListSettings', signalListSettings);
     const documentSettings: WebviewStateSettings = {
+      extensionVersion: settings.extensionVersion,
       displayedSignals: signalListSettings.signalList,
       markerTime: settings.markerTime,
       altMarkerTime: settings.altMarkerTime,
@@ -453,6 +444,7 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
       selectedSignal: settings.selectedSignal,
       zoomRatio: settings.zoomRatio,
       scrollLeft: settings.scrollLeft,
+      defaultPixelTime: settings.defaultPixelTime,
       autoReload: settings.autoReload,
     };
 
@@ -496,8 +488,10 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   private setupFileWatcher() {
     if (this.uri.scheme !== 'file') { return; }
 
+    const settings = vscode.workspace.getConfiguration('vaporview');
     const pattern = new vscode.RelativePattern(path.dirname(this.uri.fsPath), path.basename(this.uri.fsPath));
     const watcher = vscode.workspace.createFileSystemWatcher(pattern);
+    this.webviewContext.autoReload = settings.get('defaultAutoReload') || false;
     const scheduleReload = () => {
       if (this.reloadDebounce) { clearTimeout(this.reloadDebounce); }
       this.reloadDebounce = setTimeout(() => this.handleUpdateFile(), 500);
@@ -529,9 +523,9 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     const signals = variables.filter(item => item.type !== 'Parameter');
 
     if (this.sortNetlist) {
-      result.push(...(scopes.sort((a, b) => a.name.localeCompare(b.name))));
-      result.push(...(parameters.sort((a, b) => a.name.localeCompare(b.name))));
-      result.push(...(signals.sort((a, b) => a.name.localeCompare(b.name))));
+      result.push(...(scopes.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}))));
+      result.push(...(parameters.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}))));
+      result.push(...(signals.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true}))));
     } else {
       result.push(...scopes);
       result.push(...parameters);
@@ -581,9 +575,10 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
   }
 
   public async findTreeItem(scopePath: string, msb: number | undefined, lsb: number | undefined): Promise<NetlistItem | null> {
-    const module = this.treeData.find((element) => element.label === scopePath.split('.')[0]);
+    const pathArray = scopePath.split('.');
+    const module    = this.treeData.find((element) => element.label === pathArray[0]);
     if (!module) { return null; }
-    return await module.findChild(scopePath.split('.').slice(1).join('.'), this, msb, lsb);
+    return await module.findChild(pathArray.slice(1), this, msb, lsb);
   }
 
   public getNameFromNetlistId(netlistId: NetlistId | null) {
@@ -624,10 +619,13 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     const signalList: AddVariableSignal[] = [];
     if (!this.webviewPanel) { return; }
 
+    const instancePathList: string[] = [];
+
     netlistIdList.forEach((netlistId) => {
       const metadata = this.netlistIdTable[netlistId];
       if (!metadata) { return; }
 
+      instancePathList.push(metadata.instancePath());
       signalList.push({
         signalId: metadata.signalId,
         signalWidth: metadata.width,
@@ -638,20 +636,27 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
         encoding: metadata.encoding,
         enumType: metadata.enumType,
       });
-
-      this._providerDelegate.emitEvent({
-        eventType: 'addVariable',
-        uri: this.uri,
-        instancePath: metadata.instancePath(),
-        netlistId: metadata.netlistId,
-      });
     });
+
     this.webviewPanel.webview.postMessage({
       command: 'add-variable',
       signalList: signalList,
       groupPath: moveToGroup,
       index: index
     });
+
+    const eventData: SignalEvent = {
+      uri: this.uri.toString(),
+      instancePath: instancePathList,
+      netlistId: netlistIdList,
+      source: 'webview',
+    };
+
+    this._providerDelegate.emitEvent({
+      command: 'emitEvent',
+      eventType: 'addVariable',
+      eventData: eventData,
+    } as EmitEventMessage);
   }
 
   public fetchData(requestList: QueueEntry[]) {

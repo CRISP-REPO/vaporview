@@ -1,5 +1,8 @@
+import * as vscodeTypes from 'vscode';
+
+import { MarkerSetEvent, SignalEvent, ValueLinkEvent } from "../../packages/vaporview-api/types";
 import { createInstancePath } from "../common/functions";
-import { QueueEntry, WindowMessageType, StateChangeType, NetlistId, RowId, ConfigSettingsMessage, ExternalKeyDownMessage } from "../common/types";
+import { QueueEntry, WindowMessageType, StateChangeType, NetlistId, RowId, ConfigSettingsMessage, ExternalKeyDownMessage, EmitEventMessage, WebviewDropMessage } from "../common/types";
 import { ActionType, type EventHandler } from './event_handler';
 import { SignalGroup, NetlistVariable, CustomVariable } from "./signal_item";
 import { viewerState, events, createWebviewContext, viewport, rowHandler, getParentGroupIdList, labelsPanel, dataManager, controlBar, styles, unload, init, revealSignal, config } from "./vaporview";
@@ -25,6 +28,7 @@ export enum OS {
 export class Configuration {
   touchpadScrolling: boolean        = false;
   autoTouchpadScrolling: boolean    = false;
+  touchpadPinchSensitivity: number   = 18;
   rulerLines: boolean               = true;
   fillMultiBitValues: boolean       = false;
   multiBitFixedHeight: boolean      = true;
@@ -40,6 +44,7 @@ export class Configuration {
   defaultStringColor: number        = 0;
   defaultEnumColor: number          = 0;
   defaultCustomSignalColor: number  = 0;
+  customColorPalette: string[]      = ['#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC'];
 
   os: OS                            = OS.Unknown;
 
@@ -48,8 +53,12 @@ export class Configuration {
   }
 
   setConfigSettings(settings: ConfigSettingsMessage) {
+    // Scroll and zoom settings
     if (settings.scrollingMode !== undefined) {
       controlBar.setScrollMode(settings.scrollingMode);
+    }
+    if (settings.touchpadPinchSensitivity !== undefined) {
+      config.touchpadPinchSensitivity = settings.touchpadPinchSensitivity;
     }
     if (settings.rulerLines !== undefined) {
       if (this.rulerLines !== settings.rulerLines) {
@@ -101,6 +110,14 @@ export class Configuration {
       this.defaultCustomSignalColor = Math.floor(settings.defaultCustomSignalColor - 1);
     }
 
+    // Fallback custom colors
+    if (settings.customColorPalette !== undefined) {
+      this.customColorPalette = settings.customColorPalette;
+      if (!styles.themeValid) {
+        styles.updateColorPalette(this.customColorPalette, this.customColorPalette, false);
+      }
+    }
+
     // Pixel Ratio
     const oldPixelRatio = viewport.pixelRatio;
     if (settings.overrideDevicePixelRatio !== undefined) {
@@ -140,6 +157,7 @@ interface ColorProfile {
 export class ThemeColors {
 
   colorKey: string[] = ['#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC', '#CCCCCC'];
+  themeValid: boolean = false;
   xzColor: string = 'red';
   textColor: string = 'white';
   rulerTextColor: string = 'grey';
@@ -244,9 +262,10 @@ export class ThemeColors {
   //         enough colors, then select from the next tier, etc.
   updateColorPalette(colorPalette: string[], errorColorPalette: string[], themeValid: boolean) {
 
-    const style = window.getComputedStyle(document.body);
+    const style          = window.getComputedStyle(document.body);
     this.backgroundColor = style.getPropertyValue('--vscode-editor-background');
-    this.xzColor = style.getPropertyValue('--vscode-debugTokenExpression-error');
+    this.xzColor         = style.getPropertyValue('--vscode-debugTokenExpression-error');
+    this.themeValid      = themeValid;
 
     if (!themeValid) {
       //console.log("Using default color palette because theme is not valid");
@@ -255,6 +274,10 @@ export class ThemeColors {
       this.colorKey[1] = style.getPropertyValue('--vscode-debugTokenExpression-string');
       this.colorKey[2] = style.getPropertyValue('--vscode-debugTokenExpression-type');
       this.colorKey[3] = style.getPropertyValue('--vscode-debugTokenExpression-name');
+      this.colorKey[4] = config.customColorPalette[0];
+      this.colorKey[5] = config.customColorPalette[1];
+      this.colorKey[6] = config.customColorPalette[2];
+      this.colorKey[7] = config.customColorPalette[3];
       this.events.updateColorTheme();
       return;
     }
@@ -386,6 +409,8 @@ export class ThemeColors {
 
 export class VscodeWrapper {
 
+  private initComplete: boolean = false;
+
   constructor(private events: EventHandler) {
     this.handleRemoveVariable = this.handleRemoveVariable.bind(this);
     this.handleMarkerSet    = this.handleMarkerSet.bind(this);
@@ -398,6 +423,10 @@ export class VscodeWrapper {
 
   webviewReady() {
     vscode.postMessage({command: 'ready'});
+  }
+
+  setInitComplete() {
+    this.initComplete = true;
   }
 
   handleMessage(e: MessageEvent) {
@@ -428,7 +457,7 @@ export class VscodeWrapper {
       case 'setMarker':             {this.setMarker(message.time, message.markerType); break;}
       case 'setViewportTo':         {viewport.moveViewToTime(message.time); break;}
       case 'setViewportRange':      {viewport.setViewportRange(message.startTime, message.endTime); break;}
-      case 'setTimeUnits':          {viewport.updateUnits(message.units, true); break;}
+      case 'updateRulerSettings':   {this.handleUpdateRuler(message.units, message.pixelTime); break;}
       case 'setSelectedSignal':     {this.setSelectedSignal(message.netlistId); break;}
       case 'copyWaveDrom':          {copyWaveDrom(); break;}
       case 'copyValueAtMarker':     {labelsPanel.copyValueAtMarker(message.rowId); break;}
@@ -461,6 +490,15 @@ export class VscodeWrapper {
     //console.log('handleMessage - setMarker');
     this.events.markerSet(time, markerType);
     this.sendWebviewContext(StateChangeType.User);
+  }
+
+  handleUpdateRuler(units: string | undefined, pixelTime: number | undefined) {
+    if (units !== undefined) {
+      viewport.updateUnits(units, true);
+    }
+    if (pixelTime !== undefined) {
+      viewport.updateRulerNumberBasis(pixelTime, true);
+    }
   }
 
   handleUpdateVerticalScale(event: { rowId?: RowId } | null | undefined, scale: number) {
@@ -523,6 +561,7 @@ export class VscodeWrapper {
 
   sendWebviewContext(stateChangeType: number) {
     if (events.isBatchMode) {return;}
+    if (!this.initComplete) {return;}
     const context = createWebviewContext() as Record<string, unknown>;
     context.stateChangeType = stateChangeType;
     vscode.setState(context);
@@ -586,33 +625,52 @@ export class VscodeWrapper {
   }
 
   emitRemoveVariableEvent(instancePathList: string[], netlistIdList: number[]) {
+    const eventData: SignalEvent = {
+      uri: viewerState.uri?.toString() || "",
+      instancePath: instancePathList,
+      netlistId: netlistIdList,
+      source: 'viewer',
+    };
     vscode.postMessage({
       command: 'emitEvent',
       eventType: 'removeVariable',
-      uri: viewerState.uri,
-      instancePath: instancePathList,
-      netlistId: netlistIdList,
-    });
+      eventData: eventData,
+    } as EmitEventMessage);
   }
 
   emitSignalSelectEvent(instancePathList: string[], netlistIdList: number[]) {
+    const eventData: SignalEvent = {
+      uri: viewerState.uri?.toString() || "",
+      instancePath: instancePathList,
+      netlistId: netlistIdList,
+      source: 'viewer',
+    };
     vscode.postMessage({
       command: 'emitEvent',
       eventType: 'signalSelect',
-      uri: viewerState.uri,
-      instancePath: instancePathList,
-      netlistId: netlistIdList,
-    });
+      eventData: eventData,
+    } as EmitEventMessage);
   }
 
   emitMarkerSetEvent(time: number, units: string) {
+    const eventData: MarkerSetEvent = {
+      uri: viewerState.uri?.toString() || "",
+      time: time,
+      units: units,
+    };
     vscode.postMessage({
       command: 'emitEvent',
       eventType: 'markerSet',
-      uri: viewerState.uri,
-      time: time,
-      units: viewport.timeUnit,
-    });
+      eventData: eventData,
+    } as EmitEventMessage);
+  }
+
+  emitValueLinkEvent(event: ValueLinkEvent) {
+    vscode.postMessage({
+      command: 'emitEvent',
+      eventType: 'valueLink',
+      eventData: event,
+    } as EmitEventMessage);
   }
 
   handleDrop(e: DragEvent) {
@@ -622,7 +680,7 @@ export class VscodeWrapper {
     const data    = e.dataTransfer.getData('codeeditors');
     if (!data) {return;}
     const dataObj = JSON.parse(data);
-    const uriList = dataObj.map((d: { resource: string }) => {return d.resource;});
+    const uriList = dataObj.map((d: { resource: vscodeTypes.Uri }) => {return d.resource;});
 
     const {newGroupId, newIndex} = labelsPanel.dragEndExternal(e, false);
 
@@ -649,6 +707,7 @@ export class VscodeWrapper {
       dropIndex: newIndex,
       resourceUriList: uriList,
       uri: viewerState.uri,
-    });
+      documentId: viewerState.documentId,
+    } as WebviewDropMessage);
   }
 }

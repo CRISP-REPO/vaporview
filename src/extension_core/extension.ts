@@ -13,6 +13,7 @@ import type {
   GetViewerStateArgs,
   GetValuesAtTimeArgs,
   AddVariableByPathArgs,
+  ViewerState,
 } from '../../packages/vaporview-api/types';
 
 // #region activate()
@@ -93,6 +94,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Vaporv
   const signalSelectEvent = WaveformViewerProvider.signalSelectEventEmitter.event;
   const addVariableEvent = WaveformViewerProvider.addVariableEventEmitter.event;
   const removeVariableEvent = WaveformViewerProvider.removeVariableEventEmitter.event;
+  const valueLinkEvent = WaveformViewerProvider.valueLinkEventEmitter.event;
   const externalDropEvent = WaveformViewerProvider.externalDropEventEmitter.event;
 
   // Register commands (there are a lot of commands, so we register them in a separate file for cleanliness)
@@ -329,6 +331,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Vaporv
     onDidAddVariable: addVariableEvent,
     onDidRemoveVariable: removeVariableEvent,
     onDidDropInWaveformViewer: externalDropEvent,
+    onDidClickSignalValueLink: valueLinkEvent,
 
     // Commands
     async openFile(args: OpenFileArgs) {
@@ -357,7 +360,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Vaporv
     async getViewerState(args?: GetViewerStateArgs) {
       const document = viewerProvider.getDocumentFromOptionalUri(args?.uri);
       if (!document) {return undefined;}
-      return document.getSettings();
+      return document.getSettings() as unknown as ViewerState;
     },
     async getValuesAtTime(args: GetValuesAtTimeArgs) {
       const document = viewerProvider.getDocumentFromOptionalUri(args.uri);

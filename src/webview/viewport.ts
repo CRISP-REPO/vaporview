@@ -5,7 +5,7 @@ import { viewerState, dataManager, updateDisplayedSignalsFlat, handleClickSelect
 import { ValueFormat } from './value_format';
 import { WaveformRenderer } from './renderer';
 import { labelsPanel, rowHandler, vscodeWrapper, styles, config } from "./vaporview";
-import { CustomVariable, NetlistVariable, VariableItem } from "./signal_item";
+import { CustomVariable, NetlistVariable, SignalItem, VariableItem } from "./signal_item";
 
 export class Viewport {
 
@@ -57,11 +57,13 @@ export class Viewport {
 
   scrollbarMoved: boolean     = false;
   scrollbarStartX: number     = 0;
+  pointerStartX: number       = 0;
+  lastPointerX: number        = 0;
   scrollbarPointerId: number | null = null;
 
   // Zoom level variables
   zoomRatio: number           = 1;
-  defaultZoom: number         = 1;
+  defaultPixelTime: number    = 1;
   zoomOffset: number          = 0;
   pixelTime: number           = 1;
   maxZoomRatio: number        = 64;
@@ -70,14 +72,15 @@ export class Viewport {
   rulerNumberSpacing: number  = 100;
   rulerTickSpacing: number    = 10;
   rulerNumberIncrement: number = 100;
-  minNumberSpacing: number   = 100;
-  minTickSpacing: number     = 20;
+  readonly minNumberSpacing: number = 100;
+  readonly minTickSpacing: number   = 20;
   rulerLineX: [number, number][] = [];
-  annotateTime: number[]     = [];
+  annotateTime: number[]      = [];
 
   pixelRatio: number          = 1;
   updatePending: boolean      = false;
   scrollEventPending: boolean = false;
+  hoverItemRowId: RowId | null = null;
 
   constructor(
     private events: EventHandler,
@@ -137,6 +140,7 @@ export class Viewport {
     scrollbar.addEventListener('pointerdown',        (e) => {this.handleScrollbarDrag(e);});
     scrollbarContainer.addEventListener('pointerdown', (e) => {this.handleScrollbarContainerClick(e);});
     overlayCanvas.addEventListener('contextmenu',    (e) => {this.handleContextMenu(e);});
+    overlayCanvas.addEventListener("pointermove",    (e) => {this.handleMouseOver(e);});
 
     this.handleScrollbarMove = this.handleScrollbarMove.bind(this);
     this.handleScrollbarPointerUp = this.handleScrollbarPointerUp.bind(this);
@@ -174,15 +178,15 @@ export class Viewport {
 
   initViewport(metadata: WaveformDumpMetadata) {
     this.setPixelRatio();
-    this.defaultZoom     = metadata.defaultZoom;
-    this.zoomRatio       = metadata.defaultZoom;
-    this.pixelTime       = 1 / this.zoomRatio;
-    this.timeScale       = metadata.timeScale;
-    this.timeUnit        = metadata.timeUnit;
-    this.displayTimeUnit = metadata.timeUnit;
-    this.timeStop        = metadata.timeEnd;
-    this.timeTableCount  = metadata.timeTableCount;
-    this.maxZoomRatio    = this.zoomRatio * 64;
+    this.timeScale        = metadata.timeScale;
+    this.timeUnit         = metadata.timeUnit;
+    this.displayTimeUnit  = metadata.timeUnit;
+    this.timeStop         = metadata.timeEnd;
+    this.timeTableCount   = metadata.timeTableCount;
+    this.defaultPixelTime = 10 ** (Math.round(Math.log10(Number(metadata.minTimeStep))) | 0);
+    this.zoomRatio        = 1 / this.defaultPixelTime;
+    this.pixelTime        = 1 / this.zoomRatio;
+    this.maxZoomRatio     = this.zoomRatio * 256;
     this.adjustedLogTimeScale   = 0;
     this.waveformArea.innerHTML = '';
     this.updateUnits(this.timeUnit, false);
@@ -190,7 +194,7 @@ export class Viewport {
     this.addNetlistLink();
     this.updateViewportWidth();
     this.updateScrollbarResize();
-    this.handleZoom(1, 0, 0);
+    this.handleZoom(-4, 0, 0);
   }
 
   async handleColorChange() {
@@ -331,6 +335,23 @@ export class Viewport {
     this.overlayCanvasElement.setAttribute('data-vscode-context', "{}");
   }
 
+  handleMouseOver(event: MouseEvent) {
+    const rowId = this.getRowIdFromMouseEvent(event);
+    if (rowId !== null) {
+      const signalItem = rowHandler.rowItems[rowId];
+      if (signalItem instanceof NetlistVariable && signalItem.valueLinkEnable) {
+        signalItem.handleValueLinkMouseOver(event);
+      }
+    }
+    if (this.hoverItemRowId !== null && rowId !== this.hoverItemRowId) {
+      const oldSignalItem = rowHandler.rowItems[this.hoverItemRowId];
+      if (oldSignalItem instanceof NetlistVariable) {
+        oldSignalItem.handleValueLinkMouseExit(event);
+      }
+    }
+    this.hoverItemRowId = rowId;
+  }
+
   handleScrollAreaMouseDown(event: MouseEvent) {
     if (event.button === 1) {
       this.handleScrollAreaClick(event, 1);
@@ -436,8 +457,10 @@ export class Viewport {
   handleScrollbarDrag(event: PointerEvent) {
     event.preventDefault();
     event.stopPropagation();
-    this.scrollbarMoved = false;
-    this.scrollbarStartX = event.clientX;
+    this.scrollbarMoved  = false;
+    this.scrollbarStartX = this.scrollbarPosition;
+    this.pointerStartX   = event.clientX;
+    this.lastPointerX    = event.clientX;
     this.scrollbar.classList.add('is-dragging');
     this.scrollbarPointerId = event.pointerId;
     this.scrollbar.setPointerCapture(event.pointerId);
@@ -463,8 +486,16 @@ export class Viewport {
   }
 
   drawHighlightZoomCanvas(event: MouseEvent) {
-    this.updateOverlayCanvas();
+
     const ctx = this.overlayCanvas;
+
+    // workaround for issue with canvas draw
+    ctx.beginPath();
+    ctx.moveTo(0, 0);
+    ctx.lineTo(0, 1);
+    ctx.stroke();
+
+    this.updateOverlayCanvas();
     this.highlightEndEvent = event;
     if (!this.highlightStartEvent) {return;}
     const width       = Math.abs(this.highlightEndEvent.pageX - this.highlightStartEvent.pageX);
@@ -474,7 +505,7 @@ export class Viewport {
     ctx.globalAlpha   = 0.5;
     ctx.roundRect(elementLeft, styles.rulerHeight, width, this.contentArea.clientHeight - styles.rulerHeight, 2);
     ctx.fill();
-    ctx.globalAlpha = 1;
+    ctx.globalAlpha   = 1;
 
     if (width > 5) {viewerState.mouseupEventType = MouseUpEventType.HighlightZoom;}
 
@@ -487,12 +518,14 @@ export class Viewport {
 
   handleScrollbarMove(e: MouseEvent | PointerEvent) {
     if (!this.scrollbarMoved) {
-      this.scrollbarMoved = e.clientX !== this.scrollbarStartX;
+      this.scrollbarMoved = e.clientX !== this.lastPointerX;
       if (!this.scrollbarMoved) {return;}
     }
-    const newPosition   = Math.min(Math.max(0, e.clientX - this.scrollbarStartX + this.scrollbarPosition), this.maxScrollbarPosition);
-    this.scrollbarStartX = e.clientX;
+
+    this.lastPointerX   = e.clientX;
+    const newPosition   = e.clientX - this.pointerStartX + this.scrollbarStartX;
     const newScrollLeft = Math.round((newPosition / this.maxScrollbarPosition) * this.maxScrollLeft);
+    // No need to clamp the value, because handleScrollEvent() clamps it for us
     this.handleScrollEvent(newScrollLeft);
   }
 
@@ -845,14 +878,18 @@ export class Viewport {
 
   updateOverlayCanvas() {
     const ctx = this.overlayCanvas;
+    let drawAltMarker = true;
     ctx.clearRect(0, 0, this.viewerWidth, this.viewerHeight);
     ctx.strokeStyle = styles.markerColor;
     ctx.lineWidth = 1;
 
-    // set stroke dash array to 2 2
-    ctx.setLineDash([2, 2]);
-
     if (viewerState.markerTime !== null) {
+      // set stroke dash array to 2 2
+      ctx.setLineDash([2, 2]);
+      if (viewerState.altMarkerTime === viewerState.markerTime) {
+        ctx.setLineDash([]);
+        drawAltMarker = false;
+      }
       const markerX = this.getViewportLeft(viewerState.markerTime, 100);
       ctx.beginPath();
       ctx.moveTo(markerX, styles.rulerHeight);
@@ -860,12 +897,9 @@ export class Viewport {
       ctx.stroke();
     }
 
-    ctx.setLineDash([6, 2, 2, 2]);
-    if (viewerState.altMarkerTime !== null) {
-      if (viewerState.altMarkerTime === viewerState.markerTime) {
-        ctx.setLineDash([]);
-      }
-    const altMarkerX = this.getViewportLeft(viewerState.altMarkerTime, 100);
+    if (viewerState.altMarkerTime !== null && drawAltMarker) {
+      ctx.setLineDash([6, 2, 2, 2]);
+      const altMarkerX = this.getViewportLeft(viewerState.altMarkerTime, 100);
       ctx.beginPath();
       ctx.moveTo(altMarkerX, styles.rulerHeight);
       ctx.lineTo(altMarkerX, this.waveformsHeight);
@@ -878,7 +912,7 @@ export class Viewport {
   }
 
   setViewportRange(startTime: number, endTime: number) {
-    const timeRange = endTime - startTime;
+    const timeRange = Math.max(endTime - startTime, 1);
 
     if (this.updatePending) {return;}
     if (startTime < 0 || endTime <= startTime || endTime > this.timeStop) {return;}
@@ -917,17 +951,41 @@ export class Viewport {
     this.timeScrollLeft   = this.pseudoScrollLeft * this.pixelTime;
     this.viewerWidthTime  = this.viewerWidth * this.pixelTime;
     this.timeScrollRight  = this.timeScrollLeft + this.viewerWidthTime;
-    this.zoomOffset       = Math.log2(this.zoomRatio / this.defaultZoom);
-    const baseZoom        = (2 ** Math.floor(this.zoomOffset)) * this.defaultZoom;
-    const spacingRatio    = 2 ** (this.zoomOffset - Math.floor(this.zoomOffset));
-    this.rulerTickSpacing = this.minTickSpacing * spacingRatio;
-    this.rulerNumberSpacing = this.minNumberSpacing * spacingRatio;
-    this.rulerNumberIncrement = this.minNumberSpacing / baseZoom;
 
-    //console.log('zoom ratio: ' + this.zoomRatio + ' zoom offset: ' + zoomOffset + ' base zoom: ' + baseZoom);
+    //console.log('zoom ratio: ' + this.zoomRatio + ' base zoom: ' + baseZoom);
 
+    this.updateRulerSpacing();
     this.updateScrollbarResize();
     this.redrawViewport();
+  }
+
+  updateRulerNumberBasis(inputIncrement: number, updateState: boolean) {
+    let numberIncrement = this.minNumberSpacing * this.pixelTime;
+    if (inputIncrement > 0) {
+      numberIncrement = inputIncrement;
+    }
+
+    const numberBasis     = 10 ** (Math.round(Math.log10(numberIncrement)) | 0);
+    const newPixelTime    = numberBasis / this.minNumberSpacing;
+
+    if (newPixelTime === this.defaultPixelTime) {return;}
+
+    this.defaultPixelTime = newPixelTime;
+    this.updateRulerSpacing();
+    this.updateRuler();
+    this.updateBackgroundCanvas(false);
+    if (updateState) {
+      vscodeWrapper.sendWebviewContext(StateChangeType.User);
+    }
+  }
+
+  updateRulerSpacing() {
+    this.zoomOffset           = Math.log2(this.zoomRatio * this.defaultPixelTime);
+    const baseZoom            = (2 ** Math.floor(this.zoomOffset)) / this.defaultPixelTime;
+    const spacingRatio        = 2 ** (this.zoomOffset - Math.floor(this.zoomOffset));
+    this.rulerTickSpacing     = this.minTickSpacing * spacingRatio;
+    this.rulerNumberSpacing   = this.minNumberSpacing * spacingRatio;
+    this.rulerNumberIncrement = this.minNumberSpacing / baseZoom;
   }
 
   private animate(callback: (progress: number) => void): Promise<void> {
@@ -968,7 +1026,8 @@ export class Viewport {
     await this.animate((progress) => {
       const newPixelTimeStart = pixelTimeStart - (pixelTimeStart * progress);
       const newPixelTimeEnd   = pixelTimeEnd   + (pixelDelta * progress);
-      const newPixelTime      = deltaTime / (newPixelTimeEnd   - newPixelTimeStart);
+      const newDeltaTime      = Math.max(newPixelTimeEnd - newPixelTimeStart, 1);
+      const newPixelTime      = deltaTime / newDeltaTime;
       const newTimeStart      = timeStart - (newPixelTimeStart * newPixelTime);
       const newTimeEnd        = timeEnd + ((this.viewerWidth - newPixelTimeEnd) * newPixelTime);
       this.setViewportRange(newTimeStart, newTimeEnd);
@@ -1035,7 +1094,7 @@ export class Viewport {
     this.maxScrollLeft    = Math.round(Math.max((this.timeStop * this.zoomRatio) - this.viewerWidth, 0));
     this.viewerWidthTime  = this.viewerWidth * this.pixelTime;
     this.timeScrollRight  = this.timeScrollLeft + this.viewerWidthTime;
-    this.minZoomRatio     = (this.viewerWidth) / this.timeStop;
+    this.minZoomRatio     = this.viewerWidth / this.timeStop;
 
     // Update Ruler Canvas, Background Canvas, and Scrollbar Canvas Dimensions
     this.resizeCanvas(this.scrollbarCanvasElement, this.scrollbarCanvas, this.viewerWidth, 10);

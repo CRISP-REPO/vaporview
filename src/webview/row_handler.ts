@@ -15,6 +15,7 @@ interface ApplyStateSettings {
   selectedSignal?: number;
   zoomRatio?: number;
   scrollLeft?: number;
+  defaultPixelTime?: number;
 }
 
 export class RowHandler {
@@ -536,6 +537,9 @@ export class RowHandler {
       if (rowIdList.length === 0) {lastSelectedSignal = null;}
       this.events.signalSelect(rowIdList, lastSelectedSignal);
     }
+    if (settings.defaultPixelTime !== undefined) {
+      viewport.updateRulerNumberBasis(settings.defaultPixelTime, false);
+    }
 
     if (settings.zoomRatio !== undefined && settings.scrollLeft !== undefined) {
       if (!viewport.updatePending) {
@@ -948,7 +952,7 @@ export class RowHandler {
       // Number format
       if (message.numberFormat !== undefined) {
         const valueFormat = getNumberFormatById(data, message.numberFormat);
-        if (valueFormat.checkWidth(data.signalWidth)) {
+        if (valueFormat.checkWidth(data.signalWidth) || data.missingSignal) {
           const forceUpdateValueFormat = !this.events.isBatchMode;
           this.unsetValueFormat(data.getWaveformData(), data.valueFormat);
           data.valueFormat = valueFormat;
@@ -961,18 +965,10 @@ export class RowHandler {
     if (netlistData instanceof NetlistVariable) {
 
       // Value link command
-      if (message.valueLinkCommand !== undefined) {
+      if (message.valueLinkEnable !== undefined) {
 
-        if (netlistData.valueLinkCommand === "" && message.valueLinkCommand !== "") {
-          netlistData.canvas?.addEventListener("pointermove", netlistData.handleValueLinkMouseOver, true);
-          netlistData.canvas?.addEventListener("pointerleave", netlistData.handleValueLinkMouseExit, true);
-        } else if (message.valueLinkCommand === "") {
-          netlistData.canvas?.removeEventListener("pointermove", netlistData.handleValueLinkMouseOver, true);
-          netlistData.canvas?.removeEventListener("pointerleave", netlistData.handleValueLinkMouseExit, true);
-        }
-
-        netlistData.valueLinkCommand = message.valueLinkCommand;
-        netlistData.valueLinkIndex   = -1;
+        netlistData.valueLinkEnable = message.valueLinkEnable;
+        netlistData.valueLinkIndex  = -1;
       }
     }
 

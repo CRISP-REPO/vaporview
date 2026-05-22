@@ -1,4 +1,5 @@
 // Re-export shared API types from the canonical source
+import * as vscode from 'vscode';
 export type {
   DocumentId,
   NetlistId,
@@ -22,7 +23,7 @@ export type {
   SignalGroupWebviewContext,
 } from '../../packages/vaporview-api/types';
 export { NameType } from '../../packages/vaporview-api/types';
-import type { NetlistId, SignalId, RowId, SignalSeparatorContext, SignalGroupContext, CustomVariableContext, NetlistVariableContext } from '../../packages/vaporview-api/types';
+import type { NetlistId, SignalId, RowId, DocumentId, SignalSeparatorContext, SignalGroupContext, CustomVariableContext, NetlistVariableContext, ValueLinkEvent, SignalEvent, MarkerSetEvent, SavedRowItem } from '../../packages/vaporview-api/types';
 export type ValueChange = [number, string];
 export type EnumEntry   = [string, string];
 export type EnumData    = EnumEntry[];
@@ -82,10 +83,9 @@ export type WaveformDumpMetadata = {
   signalIdCount: number;
   timeTableCount: number;
   timeEnd: number;
-  defaultZoom: number;
+  minTimeStep: number;
   timeScale: number;
   timeUnit: string;
-  chunkSize: number;
   fileType?: string;
   simVersion?: string;
   simDate?: string;
@@ -100,6 +100,7 @@ export interface InitMessage {
   colorPalette: string[];
   errorColorPalette: string[];
   themeValid: boolean;
+  autoReload: boolean;
 }
 
 // This object tracks extension settings that pertain to the webview
@@ -109,6 +110,7 @@ export interface InitMessage {
 // - here - setConfigSettings()
 export interface ConfigSettingsMessage {
   scrollingMode?: string;
+  touchpadPinchSensitivity: number;
   rulerLines?: boolean;
   fillMultiBitValues?: boolean;
   multiBitFixedHeight?: boolean;
@@ -123,6 +125,7 @@ export interface ConfigSettingsMessage {
   defaultStringColor?: number;
   defaultEnumColor?: number;
   defaultCustomSignalColor?: number;
+  customColorPalette?: string[];
 }
 
 export interface ExternalKeyDownMessage {
@@ -130,6 +133,27 @@ export interface ExternalKeyDownMessage {
   keyCommand: string;
   event?: { rowId?: RowId };
 }
+
+export interface EmitEventMessage {
+  command: 'emitEvent';
+  eventType: 'markerSet' | 'signalSelect' | 'addVariable' | 'removeVariable' | 'valueLink';
+  eventData: MarkerSetEvent | SignalEvent | ValueLinkEvent;
+}
+
+export type WebviewStateEvent = {
+  stateChangeType?: StateChangeType;
+  markerTime?: number;
+  defaultPixelTime?: number;
+  altMarkerTime?: number;
+  displayTimeUnit?: string;
+  selectedSignal?: NetlistId | null;
+  displayedSignals?: SavedRowItem[];
+  zoomRatio?: number;
+  scrollLeft?: number;
+  autoReload?: boolean;
+  transitionCount?: number | null;
+  selectedSignalCount?: number;
+};
 
 export interface AddVariableSignal {
   netlistId?: NetlistId;
@@ -140,6 +164,14 @@ export interface AddVariableSignal {
   signalWidth: number;
   type: string;
   encoding: string;
+}
+
+export interface WebviewDropMessage {
+  command: 'handleDrop';
+  groupPath?: string[];
+  dropIndex?: number;
+  resourceUriList?: vscode.Uri[];
+  documentId: DocumentId;
 }
 
 export interface SetDisplayFormatMessage {
@@ -153,7 +185,19 @@ export interface SetDisplayFormatMessage {
   nameType?: string;
   customName?: string;
   numberFormat?: string;
-  valueLinkCommand?: string;
+  valueLinkEnable?: boolean;
+  annotateValue?: string[];
+}
+
+export interface DisplayFormatProperties {
+  valueFormat?: string;
+  colorIndex?: number;
+  renderType?: string;
+  rowHeight?: number;
+  verticalScale?: number;
+  nameType?: string;
+  customName?: string;
+  valueLinkEnable?: boolean;
   annotateValue?: string[];
 }
 
