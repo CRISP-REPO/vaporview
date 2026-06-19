@@ -80,6 +80,14 @@ const commonConfig = {
   logLevel: 'info',
 };
 
+// Resolve alias targets to absolute paths. Relative paths break under pnpm,
+// where these packages live in the hoisted root `.pnpm/` store, not in
+// apps/vaporview/node_modules. Resolve jsonc-parser via the shiki-bridge
+// package (where pnpm nests it) since it isn't resolvable from here directly.
+const shikiBridgeDir = path.dirname(require.resolve('vscode-shiki-bridge/package.json'));
+const shikiBridgeCjs = path.join(shikiBridgeDir, 'dist', 'index.cjs');
+const jsoncParserEsm = require.resolve('jsonc-parser/lib/esm/main.js', { paths: [shikiBridgeDir] });
+
 const extensionConfig = {
   ...commonConfig,
   entryPoints: ['src/extension_core/extension.ts'],
@@ -90,11 +98,11 @@ const extensionConfig = {
   alias: {
     // vscode-shiki-bridge ships ESM as its default export, which can't be
     // bundled into a CJS output. Point esbuild at the CJS build instead.
-    'vscode-shiki-bridge': './node_modules/vscode-shiki-bridge/dist/index.cjs',
+    'vscode-shiki-bridge': shikiBridgeCjs,
     // jsonc-parser's UMD entry passes the real Node require() into its factory,
     // so internal require('./impl/format') calls escape esbuild's module system
     // and fail at runtime. Use the ESM entry so esbuild can bundle it statically.
-    'jsonc-parser': './node_modules/jsonc-parser/lib/esm/main.js',
+    'jsonc-parser': jsoncParserEsm,
   },
   plugins: [esbuildProblemMatcherPlugin, copyNapiPlugin],
 };

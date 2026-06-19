@@ -1586,6 +1586,7 @@
     "webpack-cli": "^5.1.4"
   },
   "scripts": {
+    "install": "node -e \"\"",
     "build": "npm run compile",
     "compile-wasm": "npm run generate:model && cargo build --target wasm32-unknown-unknown --release",
     "generate:model": "wit2ts --outDir ./src/extension_core ./wit",

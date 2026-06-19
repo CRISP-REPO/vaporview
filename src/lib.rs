@@ -1,16 +1,18 @@
 // Use a procedural macro to generate bindings for the world we specified in
-// `host.wit`
+// `host.wit`. WASM-only: the component imports + Guest trait exist solely on the
+// VS Code path. The native build (feature "native") talks to the engine through
+// the DataSink/FileSource traits instead.
 
+#[cfg(feature = "wasm")]
 wit_bindgen::generate!({
   // the name of the world in the `*.wit` input file
   world: "filehandler",
 });
 
-use std::io::{self, BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Cursor, Read, Write};
 //use std::result;
 use lazy_static::lazy_static;
 use std::sync::Mutex;
-use std::sync::Arc;
 use std::cmp::max;
 use wellen::{FileFormat, Hierarchy, ScopeOrVar, ScopeRef, Signal, SignalRef, SignalSource, TimeTable, TimescaleUnit, WellenError, VarRef, Var, Scope};
 use wellen::viewers::{read_body, read_header, ReadBodyContinuation, HeaderResult};
@@ -19,9 +21,50 @@ use core::ops::Index;
 use lz4_flex::frame::FrameEncoder;
 use serde::Deserialize;
 
+// Surfer remote streaming is wired directly to the component imports, so it is
+// WASM-only for now; the native build supports local files first.
+#[cfg(feature = "wasm")]
 mod libsurfer;
+#[cfg(feature = "native")]
+pub mod native_api;
+mod host;
+use host::{DataSink, ReadSeek};
+#[cfg(feature = "wasm")]
+use host::{FileSource, SourceReader};
+
+/// WASM `DataSink`: forwards every engine result to the matching wit-bindgen
+/// component import. This is the only place the bulk-output imports are called;
+/// the engine itself talks to `&impl DataSink` and stays target-agnostic.
+#[cfg(feature = "wasm")]
+struct WasmHost;
+
+#[cfg(feature = "wasm")]
+impl DataSink for WasmHost {
+  fn log(&self, msg: &str) { log(msg); }
+  fn output_log(&self, msg: &str) { outputlog(msg); }
+  fn set_scope_top(&self, name: &str, id: u32, tpe: &str) { setscopetop(name, id, tpe); }
+  fn set_var_top(&self, name: &str, id: u32, signal_id: u32, tpe: &str, encoding: &str, width: u32, msb: i32, lsb: i32, enum_type: &str) {
+    setvartop(name, id, signal_id, tpe, encoding, width, msb, lsb, enum_type);
+  }
+  fn set_metadata(&self, scope_count: u32, var_count: u32, timescale: u32, time_unit: &str) {
+    setmetadata(scope_count, var_count, timescale, time_unit);
+  }
+  fn set_chunk_size(&self, chunk_size: u64, time_end: u64, time_table_length: u64) {
+    setchunksize(chunk_size, time_end, time_table_length);
+  }
+  fn send_transition_chunk(&self, signal_id: u32, total_chunks: u32, chunk_num: u32, min: f64, max: f64, data: &str) {
+    sendtransitiondatachunk(signal_id, total_chunks, chunk_num, min, max, data);
+  }
+  fn send_enum_chunk(&self, name: &str, total_chunks: u32, chunk_num: u32, data: &str) {
+    sendenumdata(name, total_chunks, chunk_num, data);
+  }
+  fn send_compressed_transition(&self, signal_id: u32, signal_width: u32, total_chunks: u32, chunk_num: u32, min: f64, max: f64, data: &[u8], original_size: u32) {
+    sendcompressedtransitiondata(signal_id, signal_width, total_chunks, chunk_num, min, max, data, original_size);
+  }
+}
 
 
+#[cfg(feature = "wasm")]
 #[derive(Deserialize, Debug)]
 pub struct SurferStatus {
     bytes: u64,
@@ -32,21 +75,22 @@ pub struct SurferStatus {
     file_format: String,
 }
 
+// The Dynamic variants hold a type-erased reader (`Box<dyn ReadSeek>`) so these
+// engine-state types name no target-specific reader. Any FileSource-backed
+// `SourceReader<S>` boxes into the same variant.
 enum ReadBodyEnum {
   Static(ReadBodyContinuation<Cursor<Vec<u8>>>),
-  Dynamic(ReadBodyContinuation<BufReader<WasmFileReader>>),
+  Dynamic(ReadBodyContinuation<BufReader<Box<dyn ReadSeek>>>),
   None,
 }
 
 enum HeaderResultType {
   Static(HeaderResult<Cursor<Vec<u8>>>),
-  Dynamic(HeaderResult<BufReader<WasmFileReader>>),
+  Dynamic(HeaderResult<BufReader<Box<dyn ReadSeek>>>),
   Err(WellenError),
 }
 
 lazy_static! {
-  //static ref _file: Mutex<Option<WasmFileReader>> = Mutex::new(None);
-  pub static ref BINCODE_OPTIONS: bincode::DefaultOptions = bincode::DefaultOptions::new();
   static ref _file_format : Mutex<FileFormat> = Mutex::new(FileFormat::Unknown);
   static ref _hierarchy: Mutex<Option<Hierarchy>> = Mutex::new(None);
   static ref _body: Mutex<ReadBodyEnum> = Mutex::new(ReadBodyEnum::None);
@@ -54,27 +98,36 @@ lazy_static! {
   static ref _signal_source: Mutex<Option<SignalSource>> = Mutex::new(None);
   static ref _param_table: Mutex<Option<Vec<(u32, String)>>> = Mutex::new(None);
   static ref _param_id_list: Mutex<Option<Vec<SignalRef>>> = Mutex::new(None);
-  
-  // Chunked data reassembly
+}
+
+// Surfer-remote chunk reassembly state (WASM-only). `#[cfg]` can't gate an
+// individual entry inside `lazy_static!`, so these live in their own block.
+#[cfg(feature = "wasm")]
+lazy_static! {
+  pub static ref BINCODE_OPTIONS: bincode::DefaultOptions = bincode::DefaultOptions::new();
   static ref _chunks: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
   static ref _total_chunks: Mutex<u32> = Mutex::new(0);
 }
 
-struct WasmFileReader {
+/// WASM `FileSource`: reads bytes via the `fsread` component import. The native
+/// target swaps this for a `std::fs::File`/mmap-backed source — the engine's
+/// `SourceReader<S>` adapter is identical either way.
+#[cfg(feature = "wasm")]
+struct WasmFileSource {
   fd: u32,
-  file_size: u64,
-  cursor: u64,
-  read_callback: Arc<dyn Fn(u32, u64, u32) -> Vec<u8> + Send + Sync>,
 }
 
-impl WasmFileReader {
-  fn new(fd: u32, file_size: u64) -> Self {
-    //let file_size = getsize(fd);
-    let read_callback = Arc::new(|fd, cursor, size| {fsread(fd, cursor, size)});
-    let reader = WasmFileReader { fd, file_size, cursor: 0, read_callback };
-    reader
+#[cfg(feature = "wasm")]
+impl FileSource for WasmFileSource {
+  fn read(&self, offset: u64, len: u32) -> Vec<u8> {
+    fsread(self.fd, offset, len)
   }
 }
+
+/// The reader the WASM path feeds to wellen. Kept as an alias so the
+/// `ReadBodyEnum`/`HeaderResultType` continuation types read unchanged.
+#[cfg(feature = "wasm")]
+type WasmFileReader = SourceReader<WasmFileSource>;
 
 #[derive(Deserialize, Debug)]
 pub struct VarData {
@@ -138,8 +191,8 @@ pub fn get_scope_data(hierarchy: &Hierarchy, s: ScopeRef) -> ScopeData {
   ScopeData { name, id, tpe }
 }
 
-fn load_parameters_and_signals(signal_id_list: Vec<SignalRef>, hierarchy: &Hierarchy, signal_source: &mut SignalSource) -> Vec<(SignalRef, Signal)> {
-  outputlog(&format!("Loading parameters and signals"));
+fn load_parameters_and_signals(sink: &impl DataSink, signal_id_list: Vec<SignalRef>, hierarchy: &Hierarchy, signal_source: &mut SignalSource) -> Vec<(SignalRef, Signal)> {
+  sink.output_log("Loading parameters and signals");
   let mut global_param_id_list = _param_id_list.lock().unwrap();
   let param_id_list = global_param_id_list.as_ref().unwrap();
 
@@ -187,7 +240,7 @@ fn get_parameter_value(signalid: u32) -> Option<String> {
 }
 
 
-fn send_enum_data(name: &str, values: &str) {
+fn send_enum_data(sink: &impl DataSink, name: &str, values: &str) {
   let max_return_length = 65000;
   let result_length = values.len();
   let chunk_count = (result_length as f32 / max_return_length as f32).ceil() as u32;
@@ -195,11 +248,11 @@ fn send_enum_data(name: &str, values: &str) {
     let start = i * max_return_length;
     let end = std::cmp::min((i + 1) * max_return_length, result_length as u32);
     let chunk = &values[start as usize..end as usize];
-    sendenumdata(name, chunk_count, i, chunk);
+    sink.send_enum_chunk(name, chunk_count, i, chunk);
   }
 }
 
-fn parse_value_change_data_json(signal: &Signal, time_index: &[u32], signalid: u32) {
+fn parse_value_change_data_json(sink: &impl DataSink, signal: &Signal, time_index: &[u32], signalid: u32) {
   let global_time_table = _time_table.lock().unwrap();
   let time_table = global_time_table.as_ref().unwrap();
   let transitions = signal.iter_changes();
@@ -235,11 +288,11 @@ fn parse_value_change_data_json(signal: &Signal, time_index: &[u32], signalid: u
     let start = i * max_return_length;
     let end = std::cmp::min((i + 1) * max_return_length, result_length as u32);
     let chunk = &result[start as usize..end as usize];
-    sendtransitiondatachunk(signalid, chunk_count, i as u32, min, max, chunk);
+    sink.send_transition_chunk(signalid, chunk_count, i as u32, min, max, chunk);
   }
 }
 
-fn parse_value_change_data_lz4(signal: &Signal, time_index: &[u32], signalid: u32) {
+fn parse_value_change_data_lz4(sink: &impl DataSink, signal: &Signal, time_index: &[u32], signalid: u32) {
   let global_time_table = _time_table.lock().unwrap();
   let time_table = global_time_table.as_ref().unwrap();
 
@@ -292,81 +345,13 @@ fn parse_value_change_data_lz4(signal: &Signal, time_index: &[u32], signalid: u3
         let start = i as usize * max_chunk_size;
         let end = std::cmp::min((i + 1) as usize * max_chunk_size, compressed_length);
         let chunk = &compressed_data[start..end];
-        sendcompressedtransitiondata(signalid, width, chunk_count, i as u32, min, max, chunk, original_size as u32);
+        sink.send_compressed_transition(signalid, width, chunk_count, i as u32, min, max, chunk, original_size as u32);
       }
       return; // Exit early if compression was used
     },
     Err(_) => {
-      outputlog(&format!("LZ4 compression failed for signal {}, falling back to uncompressed", signalid));
+      sink.output_log(&format!("LZ4 compression failed for signal {}, falling back to uncompressed", signalid));
     }
-  }
-}
-
-impl Read for WasmFileReader {
-  fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-    //log(&format!("Reading data from offset: {:?}, size: {:?}", self.cursor, buf.len()));
-
-    let mut bytes_read = 0;
-    let read_size = std::cmp::min(buf.len() as u32, self.file_size as u32 - self.cursor as u32) as usize;
-    while bytes_read < read_size {
-      let chunk_size = std::cmp::min(read_size - bytes_read, 32768);
-      let data = (self.read_callback)(self.fd, self.cursor, chunk_size as u32);
-      buf[bytes_read..bytes_read + chunk_size].copy_from_slice(&data);
-      self.cursor += chunk_size as u64;
-      bytes_read += chunk_size;
-    }
-    Ok(bytes_read)
-  }
-
-  fn read_exact(&mut self, buf: &mut [u8]) -> io::Result<()> {
-    //log(&format!("Reading exact data from offset: {:?}, size: {:?}", self.cursor, buf.len()));
-    let bytes_read = self.read(buf);
-    match bytes_read {
-      Ok(size) => {
-        if size == buf.len() {Ok(())}
-        else {Err(io::Error::new(io::ErrorKind::UnexpectedEof, "Failed to read all bytes"))}
-      },
-      Err(e) => Err(e),
-    }
-  }
-}
-
-impl Seek for WasmFileReader {
-  fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-    //log(&format!("Seeking to: {:?}", pos));
-    let new_cursor;
-    match pos {
-      SeekFrom::Start(offset) => { new_cursor = offset; }
-      SeekFrom::End(offset) => { new_cursor = (self.file_size as i64 + offset) as u64; }
-      SeekFrom::Current(offset) => { new_cursor = (self.cursor as i64 + offset) as u64; }
-    }
-    if (new_cursor as i64) < 0 {
-      outputlog(&format!("Invalid seek to negative position: {:?}", new_cursor));
-      self.cursor = 0;
-      return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid seek to negative position"));
-    }
-    self.cursor = std::cmp::min(new_cursor, self.file_size);
-    Ok(self.cursor)
-  }
-
-  fn rewind(&mut self) -> io::Result<()> {
-    //log(&format!("Rewinding file"));
-    self.cursor = 0;
-    Ok(())
-  }
-
-  fn stream_position(&mut self) -> io::Result<u64> {Ok(self.cursor)}
-
-  fn seek_relative(&mut self, offset: i64) -> io::Result<()> {
-    //log(&format!("Seeking relative: {:?}", offset));
-    let new_cursor = (self.cursor as i64 + offset) as i64;
-    if new_cursor < 0 {
-      outputlog(&format!("Invalid seek to negative position: {:?}", new_cursor));
-      self.cursor = 0;
-      return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid seek to negative position"));
-    }
-    self.cursor = std::cmp::min(new_cursor, self.file_size as i64) as u64;
-    Ok(())
   }
 }
 
@@ -469,21 +454,13 @@ fn search<'h>(
   }
 }
 
-struct Filecontext;
+// ============================================================================
+// ENGINE — target-agnostic core. These free functions hold the parsing /
+// extraction logic and talk only through the DataSink / FileSource traits, so
+// the WASM Guest (gated, below) and the native binding both call into them.
+// ============================================================================
 
-impl Guest for Filecontext {
-
-  fn loadremotestatus(status_data: Vec<u8>) -> String {
-    libsurfer::SurferRemote::loadremotestatus(status_data)
-  }
-
-  fn loadremotechunk(chunk_type: u32, chunk_data: Vec<u8>, chunk_index: u32, total_chunks: u32) {
-    libsurfer::SurferRemote::loadremotechunk(chunk_type, chunk_data, chunk_index, total_chunks);
-  }
-
-  fn loadfile(size: u64, fd: u32, loadstatic: bool, buffersize: u32) {
-
-    //log(&format!("Loading file from bytes: {:?}", size));
+fn engine_loadfile(sink: &impl DataSink, mut reader: Box<dyn ReadSeek>, size: u64, loadstatic: bool, buffersize: u32) {
 
     let options = LoadOptions {
       multi_thread: false, // WASM is currently single-threaded
@@ -491,7 +468,6 @@ impl Guest for Filecontext {
     };
 
     let header_result: HeaderResultType;
-    let mut reader = WasmFileReader::new(fd, size);
 
     if loadstatic {
       // Load a file statically into memory
@@ -504,7 +480,6 @@ impl Guest for Filecontext {
         Err(e) => HeaderResultType::Err(e),
       };
     } else {
-      //let file_reader = BufReader::new(reader);
       let file_reader = BufReader::with_capacity(buffersize as usize, reader);
       let result = read_header(file_reader, &options);
       header_result = match result {
@@ -532,7 +507,7 @@ impl Guest for Filecontext {
         *global_body = ReadBodyEnum::Static(header.body);
       },
       HeaderResultType::Err(e) => {
-        outputlog(&format!("Error reading header: {:?}", e));
+        sink.output_log(&format!("Error reading header: {:?}", e));
         return;
       }
     }
@@ -574,22 +549,20 @@ impl Guest for Filecontext {
       Some(scale) => scale.factor,
       None => 1,
     } as u32;
-    setmetadata(scope_count, var_count, time_scale, time_unit.as_str());
+    sink.set_metadata(scope_count, var_count, time_scale, time_unit.as_str());
 
     for s in hierarchy.scopes() {
       let scope_data = get_scope_data(&hierarchy, s);
-      setscopetop(&scope_data.name, scope_data.id, &scope_data.tpe);
+      sink.set_scope_top(&scope_data.name, scope_data.id, &scope_data.tpe);
     }
 
     for v in hierarchy.vars() {
       let var_data = get_var_data(&hierarchy, v);
-      setvartop(&var_data.name, var_data.id, var_data.signal_id, &var_data.var_type, &var_data.encoding, var_data.width, var_data.msb, var_data.lsb, &var_data.enum_name);
+      sink.set_var_top(&var_data.name, var_data.id, var_data.signal_id, &var_data.var_type, &var_data.encoding, var_data.width, var_data.msb, var_data.lsb, &var_data.enum_name);
     }
   }
 
-  fn readbody() {
-
-    //log(&format!("Reading body..."));
+fn engine_readbody(sink: &impl DataSink) {
 
     let global_hierarchy = _hierarchy.lock().unwrap();
     let hierarchy = global_hierarchy.as_ref().unwrap();
@@ -619,14 +592,14 @@ impl Guest for Filecontext {
         *global_signal_source = Some(result.source);
       },
       Err(e) => {
-        outputlog(&format!("Error reading body: {:?}", e));
+        sink.output_log(&format!("Error reading body: {:?}", e));
         return;
       }
     }
 
     let global_file_format = _file_format.lock().unwrap();
     if *global_file_format != FileFormat::Fst {
-      load_parameters_and_signals(Vec::new(), hierarchy, &mut global_signal_source.as_mut().unwrap());
+      load_parameters_and_signals(sink,Vec::new(), hierarchy, &mut global_signal_source.as_mut().unwrap());
     }
 
     let time_table = global_time_table.as_ref().unwrap();
@@ -648,13 +621,13 @@ impl Guest for Filecontext {
     //log(&format!("Setting chunk size to: {:?}", min_timestamp));
     // convert time_table_length to string with commas
 
-    setchunksize(min_timestamp / 128, time_end_extend, time_table_length as u64);
+    sink.set_chunk_size(min_timestamp / 128, time_end_extend, time_table_length as u64);
 
     // unload _body
     *global_body = ReadBodyEnum::None;
   }
 
-  fn getparametervalues(signalidlist: Vec<u32>) -> String {
+fn engine_getparametervalues(signalidlist: Vec<u32>) -> String {
     let mut result: Vec<(u32, String)> = Vec::new();
     signalidlist.iter().for_each(|signalid| {
       let param_value = get_parameter_value(*signalid);
@@ -671,7 +644,7 @@ impl Guest for Filecontext {
   // returns a JSON string of the children of the given path
   // Since WASM is limited to 64K memory, we need to limit the return size
   // and allow the function to be called multiple times to get all the data
-  fn getchildren(id: u32, startindex: u32) -> String {
+fn engine_getchildren(sink: &impl DataSink, id: u32, startindex: u32) -> String {
 
     let global_hierarchy = _hierarchy.lock().unwrap();
     let hierarchy = global_hierarchy.as_ref().unwrap();
@@ -680,7 +653,7 @@ impl Guest for Filecontext {
     let parent = ScopeRef::from_index(id as usize);
     match parent {
       Some(parent_ref) => {parent_scope = hierarchy.index(parent_ref);},
-      None => {outputlog(&format!("No scopes found")); return "{\"scopes\": [], \"vars\": []}".to_string();}
+      None => {sink.output_log("No scopes found"); return "{\"scopes\": [], \"vars\": []}".to_string();}
     }
 
     //log(&format!("Parent Scope: {:?}", parent));
@@ -739,8 +712,7 @@ impl Guest for Filecontext {
     result
   }
 
-  fn getsignaldata(signalidlist: Vec<u32>) {
-    //log(&format!("Getting signal data for signal: {:?}", signalid));
+fn engine_getsignaldata(sink: &impl DataSink, signalidlist: Vec<u32>) {
 
     let global_param_id_list = _param_id_list.lock().unwrap();
     let param_id_list = global_param_id_list.as_ref();
@@ -758,8 +730,8 @@ impl Guest for Filecontext {
       match signal_ref_option {
         Some(s) => {signal_ref_list.push(s);},
         None => {
-          outputlog(&format!("Signal not found: {}", signalid));
-          sendtransitiondatachunk(*signalid, 1, 0, 0.0, 1.0, "[]");
+          sink.output_log(&format!("Signal not found: {}", signalid));
+          sink.send_transition_chunk(*signalid, 1, 0, 0.0, 1.0, "[]");
           return;
         }
       }
@@ -774,7 +746,7 @@ impl Guest for Filecontext {
     if parameters_loaded {
       signals_loaded = signal_source.load_signals(&signal_ref_list, hierarchy, false);
     } else {
-      signals_loaded = load_parameters_and_signals(signal_ref_list, hierarchy, signal_source);
+      signals_loaded = load_parameters_and_signals(sink,signal_ref_list, hierarchy, signal_source);
     }
     signals_loaded.iter().for_each(|(s, signal)| {
 
@@ -799,16 +771,16 @@ impl Guest for Filecontext {
       let use_compression = (width > 0) && (vc_data_size > 65000);
 
       if use_compression {
-        parse_value_change_data_lz4(signal, &time_index, signalid);
+        parse_value_change_data_lz4(sink,signal, &time_index, signalid);
       } else {
-        parse_value_change_data_json(signal, &time_index, signalid);
+        parse_value_change_data_json(sink,signal, &time_index, signalid);
       }
       //log(&format!("Signal Data Sent!"));
     });
 
   }
 
-  fn getenumdata(netlistidlist: Vec<u32>) {
+fn engine_getenumdata(sink: &impl DataSink, netlistidlist: Vec<u32>) {
     let global_hierarchy = _hierarchy.lock().unwrap();
     let hierarchy = global_hierarchy.as_ref().unwrap();
 
@@ -825,8 +797,8 @@ impl Guest for Filecontext {
               let name = data.0.to_string();
               let values = data.1;
               serde_json::to_string(&values).map_or_else(
-                |err| {outputlog(&format!("Error serializing enum values for {}: {:?}", name, err));},
-                |json| {send_enum_data(&name, &json);}
+                |err| {sink.output_log(&format!("Error serializing enum values for {}: {:?}", name, err));},
+                |json| {send_enum_data(sink, &name, &json);}
               );
             },
             None => {return;}
@@ -838,7 +810,7 @@ impl Guest for Filecontext {
     });
   }
 
-  fn getvaluesattime(time: u64, paths: String) -> String {
+fn engine_getvaluesattime(time: u64, paths: String) -> String {
 
     let mut global_signal_source = _signal_source.lock().unwrap();
     let signal_source = global_signal_source.as_mut().unwrap();
@@ -922,7 +894,7 @@ impl Guest for Filecontext {
 
   }
 
-  fn searchnetlist(searchquery: String) -> String {
+fn engine_searchnetlist(searchquery: String) -> String {
     let global_hierarchy = _hierarchy.lock().unwrap();
     let hierarchy = global_hierarchy.as_ref().unwrap();
     let empty_result = "{\"totalResults\":0,\"searchResults\":[]}".to_string();
@@ -957,7 +929,7 @@ impl Guest for Filecontext {
     serde_json::to_string(&result).unwrap_or_else(|_| empty_result)
   }
 
-  fn unload() {
+fn engine_unload() {
     let mut global_signal_source = _signal_source.lock().unwrap();
     let mut global_time_table = _time_table.lock().unwrap();
     let mut global_body = _body.lock().unwrap();
@@ -968,8 +940,48 @@ impl Guest for Filecontext {
     *global_body = ReadBodyEnum::None;
     *global_hierarchy = None;
     *global_file_format = FileFormat::Unknown;
+}
+
+// ============================================================================
+// WASM transport (gated) — thin Guest wrappers that build a WASM source/sink and
+// delegate to the engine functions above.
+// ============================================================================
+
+#[cfg(feature = "wasm")]
+struct Filecontext;
+
+#[cfg(feature = "wasm")]
+impl Guest for Filecontext {
+  fn loadremotestatus(status_data: Vec<u8>) -> String {
+    libsurfer::SurferRemote::loadremotestatus(status_data)
   }
+
+  fn loadremotechunk(chunk_type: u32, chunk_data: Vec<u8>, chunk_index: u32, total_chunks: u32) {
+    libsurfer::SurferRemote::loadremotechunk(chunk_type, chunk_data, chunk_index, total_chunks);
+  }
+
+  fn loadfile(size: u64, fd: u32, loadstatic: bool, buffersize: u32) {
+    let reader: Box<dyn ReadSeek> = Box::new(WasmFileReader::new(WasmFileSource { fd }, size));
+    engine_loadfile(&WasmHost, reader, size, loadstatic, buffersize);
+  }
+
+  fn readbody() { engine_readbody(&WasmHost); }
+
+  fn getparametervalues(signalidlist: Vec<u32>) -> String { engine_getparametervalues(signalidlist) }
+
+  fn getchildren(id: u32, startindex: u32) -> String { engine_getchildren(&WasmHost, id, startindex) }
+
+  fn getsignaldata(signalidlist: Vec<u32>) { engine_getsignaldata(&WasmHost, signalidlist); }
+
+  fn getenumdata(netlistidlist: Vec<u32>) { engine_getenumdata(&WasmHost, netlistidlist); }
+
+  fn getvaluesattime(time: u64, paths: String) -> String { engine_getvaluesattime(time, paths) }
+
+  fn searchnetlist(searchquery: String) -> String { engine_searchnetlist(searchquery) }
+
+  fn unload() { engine_unload(); }
 }
 
 // Export the Filecontext to the extension code.
+#[cfg(feature = "wasm")]
 export!(Filecontext);

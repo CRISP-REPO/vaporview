@@ -8,6 +8,9 @@ readme_assets/**
 node_modules/**
 !node_modules/@vscode/codicons/**
 !node_modules/node-addon-api/**
+packages/**
+**/node_modules/**
+**/target/**
 out/**/*.map
 dist/**/*.map
 wit/**

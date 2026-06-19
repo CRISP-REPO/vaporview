@@ -1,0 +1,41 @@
+/* Standalone theme shim. The VaporView webview reads VS Code theme variables
+   (`--vscode-*`) for every color/font; outside VS Code they're undefined, so we
+   provide a dark theme here. Also sets the waveform layout custom properties the
+   webview parses on init. */
+:root {
+  --vscode-editor-background: #1e1e1e;
+  --vscode-editor-foreground: #d4d4d4;
+  --vscode-editor-font-size: 12px;
+  --vscode-editor-font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Droid Sans Mono", monospace;
+
+  --vscode-editorLineNumber-foreground: #858585;
+  --vscode-editorLineNumber-activeForeground: #c6c6c6;
+  --vscode-editorIndentGuide-background: #404040;
+  --vscode-editor-selectionBackground: #264f78;
+  --vscode-editorOverviewRuler-selectionHighlightForeground: rgba(174, 176, 173, 0.1);
+  --vscode-terminalOverviewRuler-findMatchForeground: #e2c08d;
+  --vscode-list-dropBackground: #383b3d;
+
+  --vscode-debugTokenExpression-error: #f48771;
+  --vscode-debugTokenExpression-number: #b5cea8;
+  --vscode-debugTokenExpression-string: #ce9178;
+  --vscode-debugTokenExpression-type: #4ec9b0;
+  --vscode-debugTokenExpression-name: #9cdcfe;
+
+  --vscode-foreground: #cccccc;
+  --vscode-focusBorder: #007fd4;
+  --vscode-button-background: #0e639c;
+  --vscode-button-foreground: #ffffff;
+  --vscode-input-background: #3c3c3c;
+  --vscode-input-foreground: #cccccc;
+  --vscode-scrollbarSlider-background: rgba(121, 121, 121, 0.4);
+  --vscode-scrollbarSlider-hoverBackground: rgba(100, 100, 100, 0.7);
+  --vscode-widget-shadow: rgba(0, 0, 0, 0.36);
+
+  --waveform-height: 28px;
+  --ruler-height: 36px;
+
+  color-scheme: dark;
+}
+
+html, body { height: 100%; margin: 0; background: var(--vscode-editor-background); color: var(--vscode-editor-foreground); }
