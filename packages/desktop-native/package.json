@@ -1,0 +1,15 @@
+{
+  "name": "vaporview-desktop-native",
+  "version": "0.1.0",
+  "description": "N-API addon exposing the VaporView engine to the desktop shell",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "index.node"
+  ],
+  "scripts": {
+    "build": "cargo build --release && node scripts/copy-addon.js"
+  }
+}

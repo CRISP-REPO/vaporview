@@ -4,7 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+# cdylib for the WASM component / native shared lib; rlib so native examples,
+# tests, and the Step 3 binding can link the engine as a normal Rust crate.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `wasm` builds the VS Code component (wit-bindgen Guest + host imports).
+# `native` will build the standalone-app binding (Step 2) against the same
+# engine via FileSource/DataSink. Exactly one is expected to be active.
+default = ["wasm"]
+wasm = []
+native = []
 
 [dependencies]
 lazy_static = "1.5.0"

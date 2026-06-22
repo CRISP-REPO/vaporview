@@ -462,7 +462,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
   }
 
   public getDocumentFromOptionalUri(uri: string | undefined): VaporviewDocument | undefined {
-    if (!uri) {return this.activeDocument;}
+    if (!uri) {return this.activeDocument ?? this.lastActiveDocument;}
     else {return this.documentCollection.getDocumentFromUri(uri);}
   }
 

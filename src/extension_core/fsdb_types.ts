@@ -17,6 +17,8 @@ export type FsdbWorkerCommand =
   | { command: 'getValueChanges'; signalId: number }
   | { command: 'getValuesAtTime'; signalId: number; time: number }
   | { command: 'unloadSignal'; signalId: number }
+  | { command: 'setViewWindow'; startTime: number; endTime: number }
+  | { command: 'getVarInfo'; signalId: number }
   | { command: 'unload' };
 
 // Wire format: command + id

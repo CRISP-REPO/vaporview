@@ -86,6 +86,10 @@ export type WaveformDumpMetadata = {
   minTimeStep: number;
   timeScale: number;
   timeUnit: string;
+  fileType?: string;
+  simVersion?: string;
+  simDate?: string;
+  maxVarIdcode?: number;
 };
 
 export interface InitMessage {

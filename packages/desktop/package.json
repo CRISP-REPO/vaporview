@@ -1,0 +1,29 @@
+{
+  "name": "vaporview-desktop",
+  "version": "0.1.0",
+  "description": "Standalone VaporView desktop app — Electron shell over the native engine",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:linux": "electron-builder --linux AppImage deb"
+  },
+  "devDependencies": {
+    "electron": "^31.7.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.crisp.vaporview",
+    "productName": "VaporView",
+    "files": ["src/**/*"],
+    "extraResources": [
+      { "from": "../desktop-native/index.node", "to": "desktop-native/index.node" },
+      { "from": "../../media", "to": "vaporview/media" },
+      { "from": "../../dist/webview.js", "to": "vaporview/dist/webview.js" },
+      { "from": "../../node_modules/@vscode/codicons/dist", "to": "vaporview/codicons" }
+    ],
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development"
+    }
+  }
+}

@@ -164,6 +164,29 @@ void readMetadata(const Napi::CallbackInfo &info) {
   str_T scale_unit = fsdb_obj->ffrGetScaleUnit();
   fsdb_obj->ffrExtractScaleUnit(scale_unit, digit, unit);
 
+  // Get file type
+  fsdbFileType file_type = fsdb_obj->ffrGetFileType();
+  std::string file_type_str;
+  switch (file_type) {
+    case FSDB_FT_VERILOG:           file_type_str = "Verilog"; break;
+    case FSDB_FT_VHDL:              file_type_str = "VHDL"; break;
+    case FSDB_FT_VERILOG_VHDL:      file_type_str = "Verilog_VHDL"; break;
+    case FSDB_FT_SPICE:             file_type_str = "SPICE"; break;
+    case FSDB_FT_EBC_VERILOG:       file_type_str = "EBC_Verilog"; break;
+    case FSDB_FT_EBC_VHDL:          file_type_str = "EBC_VHDL"; break;
+    case FSDB_FT_EBC_VERILOG_VHDL:  file_type_str = "EBC_Verilog_VHDL"; break;
+    default:                        file_type_str = "Unknown"; break;
+  }
+
+  // Get simulator version and date (may be null)
+  str_T sim_version = fsdb_obj->ffrGetSimVersion();
+  str_T sim_date = fsdb_obj->ffrGetSimDate();
+  std::string sim_version_str = sim_version ? std::string(sim_version) : "";
+  std::string sim_date_str = sim_date ? std::string(sim_date) : "";
+
+  // Get max var idcode (signal ID range)
+  fsdbVarIdcode max_var_idcode = fsdb_obj->ffrGetMaxVarIdcode();
+
   std::vector<Napi::Value> args;
   // scopecount: number
   args.push_back(Napi::Number::New(env, scope_offset.size()));
@@ -171,6 +194,10 @@ void readMetadata(const Napi::CallbackInfo &info) {
   args.push_back(Napi::Number::New(env, 0));
   args.push_back(Napi::Number::New(env, digit));  // timescale: number
   args.push_back(Napi::String::New(env, unit));   // timeunit: string
+  args.push_back(Napi::String::New(env, file_type_str));       // fileType: string
+  args.push_back(Napi::String::New(env, sim_version_str));     // simVersion: string
+  args.push_back(Napi::String::New(env, sim_date_str));        // simDate: string
+  args.push_back(Napi::Number::New(env, max_var_idcode));      // maxVarIdcode: number
   setMetadata.Call(args);
 
   fsdbTag64 max_time;
@@ -987,6 +1014,76 @@ Napi::Array getValuesAtTime(const Napi::CallbackInfo &info) {
   return reversedResult;
 }
 
+void setViewWindow(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  if (!CHECK_LENGTH(env, info, 2)) return;
+  if (!CHECK_NUMBER(env, info[0])) return;
+  if (!CHECK_NUMBER(env, info[1])) return;
+
+  ulong_T startVal = info[0].As<Napi::Number>().Int64Value();
+  ulong_T endVal = info[1].As<Napi::Number>().Int64Value();
+
+  fsdbTag64 start, end;
+  start.H = (uint_T)(startVal >> 32);
+  start.L = (uint_T)(startVal & 0xFFFFFFFF);
+  end.H = (uint_T)(endVal >> 32);
+  end.L = (uint_T)(endVal & 0xFFFFFFFF);
+
+  fsdb_obj->ffrSetViewWindow((fsdbXTag *)&start, (fsdbXTag *)&end);
+}
+
+Napi::Object getVarInfo(const Napi::CallbackInfo &info) {
+  Napi::Env env = info.Env();
+  Napi::Object result = Napi::Object::New(env);
+
+  if (!CHECK_LENGTH(env, info, 1)) return result;
+  if (!CHECK_NUMBER(env, info[0])) return result;
+
+#ifdef FSDB_USE_32B_IDCODE
+  fsdbVarIdcode idcode = info[0].As<Napi::Number>().Int32Value();
+#else
+  fsdbVarIdcode idcode = info[0].As<Napi::Number>().Int64Value();
+#endif
+
+  ffrVarInfo *var_info = nullptr;
+  if (FSDB_RC_SUCCESS != fsdb_obj->ffrGetVarInfoByVarIdcode(idcode, &var_info)) {
+    return result;  // empty object on failure
+  }
+
+  str_T type_str;
+  switch ((fsdbVarType)var_info->type) {
+    case FSDB_VT_VCD_WIRE:      type_str = (str_T)"wire"; break;
+    case FSDB_VT_VCD_REG:       type_str = (str_T)"reg"; break;
+    case FSDB_VT_VCD_INTEGER:   type_str = (str_T)"integer"; break;
+    case FSDB_VT_VCD_REAL:      type_str = (str_T)"real"; break;
+    case FSDB_VT_VCD_PARAMETER: type_str = (str_T)"parameter"; break;
+    case FSDB_VT_VCD_EVENT:     type_str = (str_T)"event"; break;
+    case FSDB_VT_VHDL_SIGNAL:   type_str = (str_T)"signal"; break;
+    case FSDB_VT_VHDL_VARIABLE: type_str = (str_T)"variable"; break;
+    case FSDB_VT_VHDL_CONSTANT: type_str = (str_T)"constant"; break;
+    default:                    type_str = (str_T)"unknown"; break;
+  }
+
+  str_T bpb_str;
+  switch ((fsdbBytesPerBit)var_info->bpb) {
+    case FSDB_BYTES_PER_BIT_1B: bpb_str = (str_T)"1B"; break;
+    case FSDB_BYTES_PER_BIT_2B: bpb_str = (str_T)"2B"; break;
+    case FSDB_BYTES_PER_BIT_4B: bpb_str = (str_T)"4B"; break;
+    case FSDB_BYTES_PER_BIT_8B: bpb_str = (str_T)"8B"; break;
+    default:                    bpb_str = (str_T)"unknown"; break;
+  }
+
+  result.Set("idcode", Napi::Number::New(env, idcode));
+  result.Set("type", Napi::String::New(env, type_str));
+  result.Set("bytesPerBit", Napi::String::New(env, bpb_str));
+  result.Set("lbitnum", Napi::Number::New(env, var_info->lbitnum));
+  result.Set("rbitnum", Napi::Number::New(env, var_info->rbitnum));
+  uint_T bitSize = abs(var_info->lbitnum - var_info->rbitnum) + 1;
+  result.Set("bitSize", Napi::Number::New(env, bitSize));
+
+  return result;
+}
+
 void unload(const Napi::CallbackInfo &info) {
   scope_offset.clear();
   scope_path_stack.clear();
@@ -1018,6 +1115,10 @@ Napi::Object Init(Napi::Env env, Napi::Object exports) {
               Napi::Function::New(env, getValueChanges));
   exports.Set(Napi::String::New(env, "getValuesAtTime"),
               Napi::Function::New(env, getValuesAtTime));
+  exports.Set(Napi::String::New(env, "setViewWindow"),
+              Napi::Function::New(env, setViewWindow));
+  exports.Set(Napi::String::New(env, "getVarInfo"),
+              Napi::Function::New(env, getVarInfo));
   exports.Set(Napi::String::New(env, "unload"),
               Napi::Function::New(env, unload));
   return exports;

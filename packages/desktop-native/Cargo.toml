@@ -1,0 +1,20 @@
+[package]
+name = "vaporview-desktop-native"
+version = "0.1.0"
+edition = "2021"
+description = "N-API binding exposing the VaporView engine to the Electron desktop shell"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+# The shared engine, native binding only (no wit-bindgen / WASM).
+filehandler = { path = "../..", default-features = false, features = ["native"] }
+
+[build-dependencies]
+napi-build = "2"
+
+# Isolate this crate from any ancestor so it builds as its own workspace.
+[workspace]

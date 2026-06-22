@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(xargs git log --oneline -1)",
+      "Bash(node -e \"const p=require\\('./package.json'\\); console.log\\(JSON.stringify\\(p.scripts,null,1\\)\\)\")",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(echo \"EXIT: $?\")"
+    ]
+  }
+}

@@ -1,0 +1,50 @@
+
+> vaporview@1.5.1 build /Users/aa/development/crisp/dev/crisp_virtual2/crisp/apps/vaporview
+> npm run compile
+
+
+> vaporview@1.5.1 compile
+> npm run compile-wasm && npm run check-types && node esbuild.js
+
+
+> vaporview@1.5.1 compile-wasm
+> npm run generate:model && cargo build --target wasm32-unknown-unknown --release
+
+
+> vaporview@1.5.1 generate:model
+> wit2ts --outDir ./src/extension_core ./wit
+
+    Finished `release` profile [optimized] target(s) in 0.08s
+
+> vaporview@1.5.1 check-types
+> tsc --noEmit
+
+[watch] build started
+[watch] build started
+[watch] build started
+[watch] build started
+
+  dist/webview.js      274.4kb
+  dist/webview.js.map  459.7kb
+
+⚡ Done in 364ms
+
+  dist/fsdb_worker.js      4.2kb
+  dist/fsdb_worker.js.map  7.4kb
+
+⚡ Done in 368ms
+
+  dist/worker.js      234.2kb
+  dist/worker.js.map  375.0kb
+
+⚡ Done in 364ms
+Build dist/webview.js finished
+Build dist/worker.js finished
+Build dist/fsdb_worker.js finished
+
+  dist/extension.js      772.0kb
+  dist/extension.js.map    1.3mb
+
+⚡ Done in 371ms
+Build dist/extension.js finished
+[copy-napi-headers] copied napi + node N-API headers to dist/napi/
