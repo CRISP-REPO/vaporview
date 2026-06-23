@@ -159,8 +159,7 @@ export class LabelsPanels {
     }
 
     const target = event.target as HTMLElement;
-    if (target.classList.contains('codicon-chevron-down') ||
-        target.classList.contains('codicon-chevron-right')) {
+    if (target.closest('.chevron-icon')) {
         if (rowHandler.rowItems[rowId] instanceof SignalGroup) {
           rowHandler.rowItems[rowId].toggleCollapse();
           vscodeWrapper.sendWebviewContext(StateChangeType.User);

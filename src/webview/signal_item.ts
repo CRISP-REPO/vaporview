@@ -734,9 +734,10 @@ export class SignalGroup extends SignalItem implements RowItem {
   }
 
   public createWaveformRowContent() {
-    const icon = this.collapseState === CollapseState.Expanded ? 
-      'codicon-chevron-down' : 'codicon-chevron-right';
-    return `<div class='codicon ${icon}'></div><p>${this.label}</p>`;
+    const expanded  = this.collapseState === CollapseState.Expanded;
+    const symbolId  = expanded ? 'chevron-down' : 'chevron-right';
+    const iconClass = expanded ? 'codicon-chevron-down' : 'codicon-chevron-right';
+    return `<svg class='custom-icon chevron-icon ${iconClass}' viewBox="0 0 16 16"><use href="#${symbolId}"/></svg><p>${this.label}</p>`;
   }
 
   public createLabelElement() {

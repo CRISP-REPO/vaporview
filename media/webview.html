@@ -67,6 +67,27 @@
           <symbol id="auto" viewBox="0 0 16 16">
             <text x="8" y="8" class="icon-text">auto</text>
           </symbol>
+          <symbol id="zoom-out" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M12.027 6.149a5.52 5.52 0 0 1-1.27 3.908l4.26 4.26-.7.71-4.26-4.27a5.52 5.52 0 1 1 1.97-4.608zm-5.45 4.888a4.51 4.51 0 0 0 3.18-1.32l-.04.02a4.51 4.51 0 0 0 1.36-3.2 4.5 4.5 0 1 0-4.5 4.5zm-2.54-4.98h5v1h-5v-1z"/>
+          </symbol>
+          <symbol id="zoom-in" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M12.027 6.149a5.52 5.52 0 0 1-1.27 3.908l4.26 4.26-.7.71-4.26-4.27a5.52 5.52 0 1 1 1.97-4.608zm-5.45 4.888a4.51 4.51 0 0 0 3.18-1.32l-.04.02a4.51 4.51 0 0 0 1.36-3.2 4.5 4.5 0 1 0-4.5 4.5zm2.44-4v-1h-2v-2h-1v2h-2v1h2v2h1v-2h2z"/>
+          </symbol>
+          <symbol id="arrow-left" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M7 3.093l-5 5V8.8l5 5 .707-.707-4.146-4.147H14v-1H3.56L7.708 3.8 7 3.093z"/>
+          </symbol>
+          <symbol id="arrow-right" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M9 13.887l5-5V8.18l-5-5-.707.707 4.146 4.147H2v1h10.44L8.292 13.18l.707.707z"/>
+          </symbol>
+          <symbol id="ellipsis" viewBox="0 0 16 16">
+            <path d="M4 8a1 1 0 1 1-2 0 1 1 0 0 1 2 0zm5 0a1 1 0 1 1-2 0 1 1 0 0 1 2 0zm5 0a1 1 0 1 1-2 0 1 1 0 0 1 2 0z"/>
+          </symbol>
+          <symbol id="chevron-down" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M7.976 10.072l4.357-4.357.62.618L8.284 11h-.618L3 6.333l.619-.618 4.357 4.357z"/>
+          </symbol>
+          <symbol id="chevron-right" viewBox="0 0 16 16">
+            <path fill-rule="evenodd" clip-rule="evenodd" d="M10.072 8.024L5.715 3.667l.618-.62L11 7.716v.618L6.333 13l-.618-.619 4.357-4.357z"/>
+          </symbol>
         </defs>
       </svg>
       <div class="control-bar-group">
@@ -75,11 +96,11 @@
           <span class="tooltip tooltip-arrow tooltip-left">Zoom to Fit (Ctrl/Command + 0)</span>
         </div>
         <div class="control-bar-button has-tooltip" id="zoom-out-button">
-          <div class='codicon codicon-zoom-out' style="font-size:20px"></div>
+          <svg class="custom-icon" width="20" height="20" viewBox="0 0 16 16"><use href="#zoom-out"/></svg>
           <span class="tooltip tooltip-arrow tooltip-left">Zoom Out (Ctrl/Command + scroll down)</span>
         </div>
         <div class="control-bar-button has-tooltip" id="zoom-in-button">
-          <div class='codicon codicon-zoom-in' style="font-size:20px"></div>
+          <svg class="custom-icon" width="20" height="20" viewBox="0 0 16 16"><use href="#zoom-in"/></svg>
           <span class="tooltip tooltip-arrow tooltip-left">Zoom In (Ctrl/Command + scroll up)</span>
         </div>
       </div>
@@ -120,11 +141,11 @@
           </div>
         </div>
         <div class="control-bar-button has-tooltip" id="previous-button">
-          <div class='codicon codicon-arrow-left' style="font-size:20px"></div>
+          <svg class="custom-icon" width="20" height="20" viewBox="0 0 16 16"><use href="#arrow-left"/></svg>
           <span class="tooltip tooltip-arrow">Previous</span>
         </div>
         <div class="control-bar-button has-tooltip" id="next-button">
-          <div class='codicon codicon-arrow-right' style="font-size:20px"></div>
+          <svg class="custom-icon" width="20" height="20" viewBox="0 0 16 16"><use href="#arrow-right"/></svg>
           <span class="tooltip tooltip-arrow">Next</span>
         </div>
       </div>
@@ -149,7 +170,7 @@
       </div>
       <div class="control-bar-group control-bar-right"> 
         <div class="control-bar-button has-tooltip" id="settings-menu">
-          <div class='codicon codicon-more' style="font-size:20px" data-vscode-context='{"preventDefaultContextMenuItems": true, "webviewSection": "ruler" }'></div>
+          <svg class="custom-icon" width="20" height="20" viewBox="0 0 16 16" data-vscode-context='{"preventDefaultContextMenuItems": true, "webviewSection": "ruler" }'><use href="#ellipsis"/></svg>
           <span class="tooltip tooltip-arrow tooltip-right">Settings</span>
         </div>
       </div>
