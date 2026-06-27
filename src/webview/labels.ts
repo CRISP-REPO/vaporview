@@ -310,6 +310,10 @@ export class LabelsPanels {
 
   dragStartExternal(event: MouseEvent | DragEvent) {
 
+    const types = (typeof DragEvent !== 'undefined' && event instanceof DragEvent && event.dataTransfer)
+      ? Array.from(event.dataTransfer.types || []) : [];
+    vscodeWrapper.outputDndLog(`dragStartExternal: external drag entered webview, dataTransfer.types=[${types.join(', ')}]`);
+
     this.initializeDragHandler(event);
     this.setIdleItemsState([]);
     this.defaultDragDividerY = this.labels.getBoundingClientRect().bottom + this.labelsScroll.scrollTop;
@@ -362,6 +366,16 @@ export class LabelsPanels {
   }
 
   public dragMoveExternal(event: MouseEvent | DragEvent) {
+
+    // HTML5 drag-and-drop: the `drop` event fires ONLY if the `dragover` handler calls
+    // preventDefault() (and the element is thereby marked a valid drop target). Without
+    // it, external drops silently no-op on strict platforms (Windows/Chromium) even
+    // though they may appear to work elsewhere. This is the dragover handler, so make
+    // the webview a valid drop target for drags coming from the netlist tree / editors.
+    if (typeof DragEvent !== 'undefined' && event instanceof DragEvent) {
+      event.preventDefault();
+      if (event.dataTransfer) {event.dataTransfer.dropEffect = 'copy';}
+    }
 
     if (!this.dragInProgress) {
       this.dragStartExternal(event);

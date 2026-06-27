@@ -391,6 +391,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
 
       switch (e.command) {
         case 'logOutput':           {this.log.appendLine(e.message); break;}
+        case 'logDnd':              {if (process.env.CRISP_DEV_DEBUG_DND === '1') {this.log.appendLine('[DND][webview] ' + e.message);} break;}
         case 'showMessage':         {this.handleWebviewMessage(e); break;}
         case 'copyToClipboard':     {vscode.env.clipboard.writeText(e.text); break;}
         case 'executeCommand':      {vscode.commands.executeCommand(e.commandName, ...(e.args || [])); break;}
@@ -996,13 +997,20 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
 
   private handleWebviewDrop(e: WebviewDropMessage) {
 
+    const _dnd = process.env.CRISP_DEV_DEBUG_DND === '1';
+    const dlog = (m: string) => { if (_dnd) {this.log.appendLine('[DND][ext] ' + m);} };
+
     const unknownUriList: vscode.Uri[] = [];
     const netlistIdList: NetlistId[] = [];
     const document = this.documentCollection.get(e.documentId);
-    if (!document) {return;}
-    if (!e.resourceUriList) {return;}
+    dlog(`handleWebviewDrop documentId=${e.documentId} found=${!!document} uriCount=${e.resourceUriList?.length ?? 0} groupPath=${JSON.stringify(e.groupPath)} dropIndex=${e.dropIndex}`);
+    if (!document) {dlog('no document for documentId — aborting'); return;}
+    if (!e.resourceUriList) {dlog('no resourceUriList — aborting'); return;}
 
-    e.resourceUriList.forEach((uri: vscode.Uri) => {
+    e.resourceUriList.forEach((uri: vscode.Uri, i: number) => {
+      // URIs arrive over postMessage as plain objects; log the raw fields that matter
+      // for the Windows-host / Linux-remote path mismatch (scheme, path, fsPath).
+      dlog(`  uri[${i}] scheme=${(uri as any)?.scheme} path=${(uri as any)?.path} fsPath=${(() => { try { return (uri as any)?.fsPath; } catch { return '(throws)'; } })()} fragment=${(uri as any)?.fragment}`);
       if (uri.scheme === 'waveform') {
 
         //const fragment = uri.fragment;
@@ -1031,7 +1039,8 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     if (e.groupPath) {groupPath = e.groupPath;}
     if (e.dropIndex || e.dropIndex === 0) {index = e.dropIndex;}
 
-    if (document !== this.activeDocument) {return;}
+    dlog(`resolved netlistIds=[${netlistIdList.join(',')}] unknownUris=${unknownUriList.length} activeMatch=${document === this.activeDocument}`);
+    if (document !== this.activeDocument) {dlog('dropped document is not the active document — aborting render'); return;}
     document.renderSignals(netlistIdList, groupPath, index);
     // shift focus to the document if any signals were added
     if (netlistIdList.length > 0) {

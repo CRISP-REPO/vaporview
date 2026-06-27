@@ -656,6 +656,16 @@ export class VscodeWrapper {
     });
   }
 
+  // Drag-and-drop diagnostics. Always posted (drops are user-initiated + infrequent);
+  // the extension only writes it to the Vaporview output channel when
+  // CRISP_DEV_DEBUG_DND=1, so there's no noise unless debugging is enabled.
+  outputDndLog(message: string) {
+    vscode.postMessage({
+      command: 'logDnd',
+      message: message,
+    });
+  }
+
   emitRemoveVariableEvent(instancePathList: string[], netlistIdList: number[]) {
     const eventData: SignalEvent = {
       uri: viewerState.uri?.toString() || "",
@@ -708,11 +718,28 @@ export class VscodeWrapper {
   handleDrop(e: DragEvent) {
     e.preventDefault();
 
-    if (!e.dataTransfer) {return;}
+    // Capture what the drag payload actually contains. On a Windows host driving a
+    // Linux remote workspace, the 'codeeditors' transfer can be absent or carry a
+    // different shape, which makes the drop silently no-op below — this surfaces it.
+    if (!e.dataTransfer) {this.outputDndLog('drop: no dataTransfer'); return;}
+    const types = Array.from(e.dataTransfer.types || []);
     const data    = e.dataTransfer.getData('codeeditors');
-    if (!data) {return;}
-    const dataObj = JSON.parse(data);
+    this.outputDndLog(`drop: types=[${types.join(', ')}] codeeditors.len=${data ? data.length : 0} uriList.len=${e.dataTransfer.getData('text/uri-list')?.length ?? 0}`);
+    if (!data) {
+      // Dump every available type so we can see where the payload actually went.
+      const dump = types.map((t) => `${t}=${JSON.stringify((e.dataTransfer!.getData(t) || '').slice(0, 300))}`).join(' | ');
+      this.outputDndLog(`drop: 'codeeditors' empty — no signals added. payload: ${dump}`);
+      return;
+    }
+    let dataObj: any;
+    try {
+      dataObj = JSON.parse(data);
+    } catch (err) {
+      this.outputDndLog(`drop: failed to JSON.parse 'codeeditors': ${String(err)} raw=${data.slice(0, 300)}`);
+      return;
+    }
     const uriList = dataObj.map((d: { resource: vscodeTypes.Uri }) => {return d.resource;});
+    this.outputDndLog(`drop: parsed ${uriList.length} uri(s): ${uriList.map((u: any) => `${u?.scheme}:${u?.path ?? u?.fsPath}`).join(', ')}`);
 
     const {newGroupId, newIndex} = labelsPanel.dragEndExternal(e, false);
     dragController.markEnded();
