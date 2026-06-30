@@ -143,9 +143,12 @@ export interface VariableActionArgs {
   recursive?: boolean;
   reveal?: boolean;
   valueLinkEnable?: boolean;
+  /** Color palette index 0-7 (0=green,1=orange,2=blue,3=purple,4-7=custom) for the
+   * 'setColor' action — used by waveformViewer.setVariableColor to highlight a signal. */
+  colorIndex?: number;
 }
 
-export type VariableAction = 'add' | 'remove' | 'reveal' | 'addLink';
+export type VariableAction = 'add' | 'remove' | 'reveal' | 'addLink' | 'setColor';
 
 /** Arguments for `waveformViewer.setMarker` */
 export interface SetMarkerArgs {

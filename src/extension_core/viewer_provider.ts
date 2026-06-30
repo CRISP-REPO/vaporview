@@ -965,6 +965,14 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
         }
         break;
       }
+      case "setColor": {
+        // Highlight a displayed signal with a palette color (used by the code tracer to
+        // mark the origin + root-cause signals). Caller adds the signal first, then colors it.
+        if (metadata.contextValue !== 'netlistScope' && typeof e.colorIndex === 'number') {
+          this.setValueFormat({netlistId: metadata.netlistId}, 0, {colorIndex: e.colorIndex});
+        }
+        break;
+      }
     }
   }
 

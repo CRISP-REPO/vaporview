@@ -62,6 +62,11 @@ export function registerVaporviewCommands(
     viewerProvider.variableActionCommandHandler(e, "addLink");
   }));
 
+  context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.setVariableColor', (e: VariableActionArgs) => {
+    outputLog.appendLine("Command called: 'waveformViewer.setVariableColor' " + JSON.stringify(e));
+    viewerProvider.variableActionCommandHandler(e, "setColor");
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('waveformViewer.setMarker', (e: SetMarkerArgs) => {
     outputLog.appendLine("Command called: 'waveformViewer.setMarker' " + JSON.stringify(e));
     viewerProvider.markerCommandHandler(e);
