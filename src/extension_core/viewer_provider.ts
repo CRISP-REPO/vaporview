@@ -936,6 +936,14 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     switch (action) {
       case 'add': {
         if (metadata.contextValue === 'netlistScope') {
+          // leafOnly: caller wants a single signal, not a whole scope. A path that
+          // resolves to a scope (struct/interface/array/memory) is skipped rather than
+          // expanded — this stops the code tracer's reveal from flooding the viewer and
+          // tripping the ">24 signals" warning.
+          if (e.leafOnly === true) {
+            this.log.appendLine(`waveformViewer.addVariable: '${e.instancePath ?? e.netlistId}' is a scope; skipped (leafOnly)`);
+            break;
+          }
           const recursive = e.recursive === true;
           this.addAllInScopeToDocument(metadata, recursive, 128);
         } else {

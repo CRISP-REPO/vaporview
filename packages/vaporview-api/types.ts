@@ -146,6 +146,11 @@ export interface VariableActionArgs {
   /** Color palette index 0-7 (0=green,1=orange,2=blue,3=purple,4-7=custom) for the
    * 'setColor' action — used by waveformViewer.setVariableColor to highlight a signal. */
   colorIndex?: number;
+  /** 'add' action only: when true, a path that resolves to a SCOPE is skipped instead of
+   * expanding to every signal in that scope. Used by the code tracer's reveal so a trace
+   * never floods the viewer (a struct/interface/array/memory path is a scope) — it should
+   * add individual signals only. */
+  leafOnly?: boolean;
 }
 
 export type VariableAction = 'add' | 'remove' | 'reveal' | 'addLink' | 'setColor';
