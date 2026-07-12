@@ -128,6 +128,25 @@ const fsdbWorkerConfig = {
   target: 'es2020', // Modern browsers support WASM
 };
 
+// Standalone host for Crisp Desktop: drives the parser outside VSCode by
+// aliasing `vscode` to a minimal Node shim. Reuses dist/worker.js + the wasm.
+const standaloneHostConfig = {
+  ...commonConfig,
+  entryPoints: ['src/standalone/host.ts'],
+  format: 'cjs',
+  platform: 'node',
+  outfile: 'dist/standalone-host.js',
+  // Resolve `vscode` to the shim. vscode-shiki-bridge (theme reader, only used
+  // by viewer_provider, never on the parse path) is stubbed so its shiki +
+  // jsonc-parser UMD deps drop out of the bundle entirely.
+  alias: {
+    'vscode': './src/standalone/vscodeShims.ts',
+    'vscode-shiki-bridge': './src/standalone/shikiBridgeStub.ts',
+  },
+  plugins: [esbuildProblemMatcherPlugin],
+  target: 'es2020',
+};
+
 const webviewConfig = {
   ...commonConfig,
   entryPoints: ['src/webview/vaporview.ts'],
@@ -147,19 +166,22 @@ async function main() {
       const webviewCtx = await esbuild.context(webviewConfig);
       const workerCtx = await esbuild.context(workerConfig);
       const fsdbWorkerCtx = await esbuild.context(fsdbWorkerConfig);
+      const standaloneHostCtx = await esbuild.context(standaloneHostConfig);
 
       await Promise.all([
         extensionCtx.watch(),
         webviewCtx.watch(),
         workerCtx.watch(),
-        fsdbWorkerCtx.watch()
+        fsdbWorkerCtx.watch(),
+        standaloneHostCtx.watch()
       ]);
     } else {
       await Promise.all([
         esbuild.build(extensionConfig),
         esbuild.build(webviewConfig),
         esbuild.build(workerConfig),
-        esbuild.build(fsdbWorkerConfig)
+        esbuild.build(fsdbWorkerConfig),
+        esbuild.build(standaloneHostConfig)
       ]);
     }
   } catch (err) {
