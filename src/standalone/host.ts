@@ -12,8 +12,11 @@
  * (running in QtWebEngine) and relays its postMessage traffic to/from this
  * process verbatim — so neither the webview nor the parser needs to change.
  *
- * Scope: the VCD/FST/GHW (wellen wasm) path. fsdb is intentionally not wired
- * here (it needs the proprietary Verdi addon); see PROTOCOL notes.
+ * Formats: VCD/FST/GHW via the wellen wasm; FSDB via the Verdi FsdbReader
+ * native addon (FsdbFormatHandler local-Linux path — reader libs resolved from
+ * CRISP_FSDB_READER_LIBS / VERDI_HOME by the vscodeShims config, the
+ * fsdb_worker forked with LD_LIBRARY_PATH augmented, and a prebuilt addon
+ * honored via CRISP_FSDB_ADDON or the CLI's <cwd>/.crisp-fsdb build).
  *
  * Build: esbuild `standaloneConfig` aliases `vscode` → ./vscodeShims and emits
  * dist/standalone-host.js (CJS, Node).
@@ -24,6 +27,7 @@ import * as nodePath from "path";
 
 import { Uri } from "./vscodeShims";
 import { WasmFormatHandler } from "../extension_core/wasm_handler";
+import { FsdbFormatHandler } from "../extension_core/fsdb_handler";
 import { VaporviewDocument } from "../extension_core/document";
 
 /** Default signal colour palette (the webview falls back to these when no VSCode theme is available). */
@@ -66,18 +70,6 @@ async function main() {
 	const uri = Uri.file(file);
 	const fileType = nodePath.extname(file).slice(1).toLowerCase();
 
-	// Locate sibling build artifacts relative to this bundle (dist/).
-	const wasmWorkerFile = nodePath.join(__dirname, "worker.js");
-	const wasmPath = nodePath.join(__dirname, "..", "target", "wasm32-unknown-unknown", "release", "filehandler.wasm");
-
-	let wasmModule: WebAssembly.Module;
-	try {
-		wasmModule = await WebAssembly.compile(new Uint8Array(await readFile(wasmPath)));
-	} catch (e) {
-		logErr(`standalone-host: failed to load wasm at ${wasmPath}: ${e instanceof Error ? e.message : e}`);
-		process.exit(3);
-	}
-
 	// Minimal document delegate — the VSCode-coupled bits collapse to no-ops or
 	// stderr; the webview gets its colours from the constant palette.
 	const delegate = {
@@ -104,13 +96,32 @@ async function main() {
 		getColorPalette: delegate.getColorPalette,
 	};
 
-	let handler: WasmFormatHandler;
-	try {
+	let handler: WasmFormatHandler | FsdbFormatHandler;
+	if (fileType === "fsdb") {
+		// Verdi FsdbReader path — no wasm needed. The handler resolves the
+		// reader libs via the shimmed vaporview config (CRISP_FSDB_READER_LIBS
+		// / VERDI_HOME) and forks dist/fsdb_worker.js next to this bundle.
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		handler = await WasmFormatHandler.create(delegate as any, uri as any, fileType, wasmWorkerFile, wasmModule);
-	} catch (e) {
-		logErr(`standalone-host: failed to create handler: ${e instanceof Error ? e.message : e}`);
-		process.exit(4);
+		handler = new FsdbFormatHandler(delegate as any, uri as any, async () => null);
+	} else {
+		// Locate sibling build artifacts relative to this bundle (dist/).
+		const wasmWorkerFile = nodePath.join(__dirname, "worker.js");
+		const wasmPath = nodePath.join(__dirname, "..", "target", "wasm32-unknown-unknown", "release", "filehandler.wasm");
+
+		let wasmModule: WebAssembly.Module;
+		try {
+			wasmModule = await WebAssembly.compile(new Uint8Array(await readFile(wasmPath)));
+		} catch (e) {
+			logErr(`standalone-host: failed to load wasm at ${wasmPath}: ${e instanceof Error ? e.message : e}`);
+			process.exit(3);
+		}
+		try {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			handler = await WasmFormatHandler.create(delegate as any, uri as any, fileType, wasmWorkerFile, wasmModule);
+		} catch (e) {
+			logErr(`standalone-host: failed to create handler: ${e instanceof Error ? e.message : e}`);
+			process.exit(4);
+		}
 	}
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -123,6 +134,22 @@ async function main() {
 		logErr(`standalone-host: failed to parse ${file}: ${e instanceof Error ? e.message : e}`);
 		emit({ command: "showMessage", messageType: "error", message: `Failed to parse ${file}` });
 		process.exit(5);
+	}
+
+	// FsdbFormatHandler.loadNetlist reports failures via showErrorMessage and
+	// RETURNS instead of throwing — a silent no-netlist document. Turn that
+	// into an explicit, machine-readable failure for the desktop app.
+	if (fileType === "fsdb" && !document.metadata.timeTableLoaded) {
+		logErr("standalone-host: FSDB open failed — reader runtime unavailable (see messages above)");
+		emit({
+			command: "showMessage",
+			messageType: "error",
+			message:
+				"FSDB open failed — the Verdi reader runtime did not initialize. " +
+				"Check CRISP_FSDB_READER_LIBS, and make sure the native addon exists " +
+				"(ask Crisp about this file once in chat to auto-build it, or set CRISP_FSDB_ADDON).",
+		});
+		process.exit(6);
 	}
 
 	// A fake "webview panel" whose postMessage is our stdout. document and the

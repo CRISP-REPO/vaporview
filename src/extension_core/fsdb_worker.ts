@@ -28,7 +28,13 @@ interface FsdbAddon {
 
 let fsdbAddon: FsdbAddon | null = null;
 try {
-    fsdbAddon = require('../build/Release/fsdb_reader.node');
+    // CRISP_FSDB_ADDON points at a prebuilt fsdb_reader.node (e.g. the Crisp
+    // CLI's auto-build under <workspace>/.crisp-fsdb) — takes precedence over
+    // the in-tree build. Dynamic require: esbuild leaves it for runtime.
+    const addonOverride = process.env.CRISP_FSDB_ADDON;
+    fsdbAddon = addonOverride
+        ? require(addonOverride)
+        : require('../build/Release/fsdb_reader.node');
     // fsdbAddon = require('../build/Debug/fsdb_reader.node');
     // To debug node module:
     // 1. Build the addon with debug symbols: `node-gyp rebuild --debug`

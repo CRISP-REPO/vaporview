@@ -695,10 +695,26 @@ export class FsdbFormatHandler implements WaveformFileParser {
 
     log(`[FSDB] ensureFsdbAddon: vaporviewRoot=${vaporviewRoot}, fsdbLibsPath=${fsdbLibsPath}`);
 
+    // Prebuilt addon short-circuits: an explicit CRISP_FSDB_ADDON path, or the
+    // Crisp CLI's auto-build for this workspace (<cwd>/.crisp-fsdb). The forked
+    // worker honors CRISP_FSDB_ADDON, so resolving into that env var is enough.
+    const envAddon = process.env.CRISP_FSDB_ADDON;
+    if (envAddon && fs.existsSync(envAddon)) {
+      log(`[FSDB] using prebuilt addon from CRISP_FSDB_ADDON: ${envAddon}`);
+      return true;
+    }
+
     const addonPath = path.join(vaporviewRoot, 'build', 'Release', 'fsdb_reader.node');
     log(`[FSDB] checking addon at ${addonPath}`);
     if (fs.existsSync(addonPath)) {
       log(`[FSDB] addon already exists — skip build`);
+      return true;
+    }
+
+    const cliAddon = path.join(process.cwd(), '.crisp-fsdb', 'build', 'Release', 'fsdb_reader.node');
+    if (fs.existsSync(cliAddon)) {
+      log(`[FSDB] using CLI-built addon: ${cliAddon}`);
+      process.env.CRISP_FSDB_ADDON = cliAddon;
       return true;
     }
     log(`[FSDB] addon NOT found — will attempt auto-build`);

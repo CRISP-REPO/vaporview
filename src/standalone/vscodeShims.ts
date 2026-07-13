@@ -11,8 +11,41 @@
  * This is NOT a faithful VSCode emulation — it is the smallest shim that lets
  * the parser produce `update-waveform-chunk*` messages.
  */
-import { promises as fsp, statSync } from "fs";
+import { promises as fsp, statSync, existsSync } from "fs";
 import * as nodePath from "path";
+
+/**
+ * FSDB reader libs for the standalone FsdbFormatHandler path. Mirrors the
+ * CLI's resolution (CRISP_FSDB_READER_LIBS first), then VERDI_HOME with an
+ * ARCH-AWARE subdir — the extension's own fallback hardcodes linux64, which
+ * is wrong on aarch64 hosts (newer Verdi ships share/FsdbReader/aarch64).
+ */
+function resolveFsdbReaderLibs(): string | undefined {
+	const explicit = process.env.CRISP_FSDB_READER_LIBS;
+	if (explicit) {
+		return explicit;
+	}
+	const verdiHome = process.env.VERDI_HOME;
+	if (verdiHome) {
+		const archDir = process.arch === "arm64" ? "aarch64" : "linux64";
+		const primary = nodePath.join(verdiHome, "share", "FsdbReader", archDir);
+		if (existsSync(primary)) {
+			return primary;
+		}
+		const alternate = nodePath.join(
+			verdiHome, "share", "FsdbReader", archDir === "aarch64" ? "linux64" : "aarch64");
+		if (existsSync(alternate)) {
+			return alternate;
+		}
+		return primary; // let the handler's own validation report what's missing
+	}
+	return undefined; // handler falls back to XCELIUM_HOME etc.
+}
+
+/** Host→webview protocol line on stdout (the shim runs inside the host process). */
+function emitProtocol(message: Record<string, unknown>): void {
+	process.stdout.write(JSON.stringify(message) + "\n");
+}
 
 // --- Disposable ------------------------------------------------------------
 
@@ -86,6 +119,9 @@ const CONFIG_DEFAULTS: Record<string, unknown> = {
 
 class WorkspaceConfiguration {
 	get<T>(key: string, defaultValue?: T): T | undefined {
+		if (key === "fsdbReaderLibsPath") {
+			return resolveFsdbReaderLibs() as T | undefined;
+		}
 		if (key in CONFIG_DEFAULTS) {
 			return CONFIG_DEFAULTS[key] as T;
 		}
@@ -201,13 +237,23 @@ export const window = {
 	createStatusBarItem() {
 		return { text: "", tooltip: "", show() {}, hide() {}, dispose() {} };
 	},
-	async showErrorMessage(): Promise<undefined> {
+	// Message dialogs become protocol lines so the desktop app can surface
+	// them (the FSDB path reports all its failures through these).
+	async showErrorMessage(message?: unknown): Promise<undefined> {
+		const text = typeof message === "string" ? message : String(message ?? "");
+		process.stderr.write(`[error] ${text}\n`);
+		emitProtocol({ command: "showMessage", messageType: "error", message: text });
 		return undefined;
 	},
-	async showWarningMessage(): Promise<undefined> {
+	async showWarningMessage(message?: unknown): Promise<undefined> {
+		const text = typeof message === "string" ? message : String(message ?? "");
+		process.stderr.write(`[warn] ${text}\n`);
+		emitProtocol({ command: "showMessage", messageType: "warning", message: text });
 		return undefined;
 	},
-	async showInformationMessage(): Promise<undefined> {
+	async showInformationMessage(message?: unknown): Promise<undefined> {
+		const text = typeof message === "string" ? message : String(message ?? "");
+		process.stderr.write(`[info] ${text}\n`);
 		return undefined;
 	},
 	createOutputChannel(name: string) {
