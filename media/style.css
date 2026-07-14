@@ -87,6 +87,18 @@ body {
   user-select: none;
 }
 
+/* Signal-group expand/collapse chevron in the waveform labels pane. Its container
+   (.waveform-row) sets no fill/size, so without this the SVG inherits a black fill
+   and renders at the default (oversized) SVG dimensions. */
+.chevron-icon {
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  flex: 0 0 16px;
+  fill: var(--vscode-icon-foreground);
+  cursor: pointer;
+}
+
 .icon-text {
   text-anchor: middle;
   dominant-baseline: central;
@@ -511,6 +523,29 @@ body {
   stroke: var(--vscode-editorCursor-foreground);
   stroke-dasharray: 2 2;
 }
+
+/* Highlight the signal row a dragged-in signal will drop next to. */
+.waveform-label.drop-target-highlight {
+  background-color: var(--vscode-list-dropBackground, var(--vscode-list-hoverBackground));
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* Waveform-pane signal filter. */
+.signal-filter-input {
+  width: 100%;
+  box-sizing: border-box;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+  padding: 1px 4px;
+  font-size: var(--vscode-font-size);
+  outline: none;
+}
+.signal-filter-input:focus { border-color: var(--vscode-focusBorder); }
+
+/* Rows hidden by the signal filter (applied to label + value + waveform columns). */
+.filtered-out { display: none !important; }
 
 .waveform-group {
   overflow: visible;

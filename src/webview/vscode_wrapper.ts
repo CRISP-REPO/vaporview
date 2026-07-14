@@ -1,6 +1,6 @@
 import * as vscodeTypes from 'vscode';
 
-import { MarkerSetEvent, SignalEvent, ValueLinkEvent } from "../../packages/vaporview-api/types";
+import { MarkerSetEvent, SignalEvent, ValueLinkEvent, DoubleClickSignalEvent } from "../../packages/vaporview-api/types";
 import { createInstancePath } from "../common/functions";
 import { QueueEntry, WindowMessageType, StateChangeType, NetlistId, RowId, ConfigSettingsMessage, ExternalKeyDownMessage, EmitEventMessage, WebviewDropMessage } from "../common/types";
 import { ActionType, type EventHandler } from './event_handler';
@@ -715,31 +715,62 @@ export class VscodeWrapper {
     } as EmitEventMessage);
   }
 
+  emitDoubleClickSignalEvent(event: DoubleClickSignalEvent) {
+    vscode.postMessage({
+      command: 'emitEvent',
+      eventType: 'doubleClickSignal',
+      eventData: event,
+    } as EmitEventMessage);
+  }
+
   handleDrop(e: DragEvent) {
     e.preventDefault();
 
-    // Capture what the drag payload actually contains. On a Windows host driving a
-    // Linux remote workspace, the 'codeeditors' transfer can be absent or carry a
-    // different shape, which makes the drop silently no-op below — this surfaces it.
     if (!e.dataTransfer) {this.outputDndLog('drop: no dataTransfer'); return;}
     const types = Array.from(e.dataTransfer.types || []);
-    const data    = e.dataTransfer.getData('codeeditors');
-    this.outputDndLog(`drop: types=[${types.join(', ')}] codeeditors.len=${data ? data.length : 0} uriList.len=${e.dataTransfer.getData('text/uri-list')?.length ?? 0}`);
-    if (!data) {
-      // Dump every available type so we can see where the payload actually went.
-      const dump = types.map((t) => `${t}=${JSON.stringify((e.dataTransfer!.getData(t) || '').slice(0, 300))}`).join(' | ');
-      this.outputDndLog(`drop: 'codeeditors' empty — no signals added. payload: ${dump}`);
-      return;
+
+    let uriList: vscodeTypes.Uri[] = [];
+    let netlistIdList: number[] | undefined;
+    let instancePathList: string[] | undefined;
+
+    // Preferred path: a drag from the Netlist Explorer webview carries a custom MIME
+    // with the netlist ids (tree rows) or instance paths (search results) directly.
+    // This is plain HTML5 DnD (not the tree's 'codeeditors' resource drag), so it
+    // needs NO Shift key.
+    const netlistData = e.dataTransfer.getData('application/x-vaporview-netlist');
+    if (netlistData) {
+      try {
+        const items = JSON.parse(netlistData) as Array<{netlistId?: number; instancePath?: string}>;
+        netlistIdList = items
+          .filter((i) => i.netlistId !== undefined && i.netlistId !== null)
+          .map((i) => i.netlistId as number);
+        instancePathList = items
+          .filter((i) => (i.netlistId === undefined || i.netlistId === null) && !!i.instancePath)
+          .map((i) => i.instancePath as string);
+        this.outputDndLog(`drop: netlist-explorer payload — ${netlistIdList.length} id(s), ${instancePathList.length} path(s)`);
+      } catch (err) {
+        this.outputDndLog(`drop: failed to JSON.parse netlist payload: ${String(err)}`);
+        return;
+      }
+    } else {
+      // Fallback: a drag of an editor resource (e.g. from other sources) via 'codeeditors'.
+      const data = e.dataTransfer.getData('codeeditors');
+      this.outputDndLog(`drop: types=[${types.join(', ')}] codeeditors.len=${data ? data.length : 0} uriList.len=${e.dataTransfer.getData('text/uri-list')?.length ?? 0}`);
+      if (!data) {
+        const dump = types.map((t) => `${t}=${JSON.stringify((e.dataTransfer!.getData(t) || '').slice(0, 300))}`).join(' | ');
+        this.outputDndLog(`drop: 'codeeditors' empty — no signals added. payload: ${dump}`);
+        return;
+      }
+      let dataObj: any;
+      try {
+        dataObj = JSON.parse(data);
+      } catch (err) {
+        this.outputDndLog(`drop: failed to JSON.parse 'codeeditors': ${String(err)} raw=${data.slice(0, 300)}`);
+        return;
+      }
+      uriList = dataObj.map((d: { resource: vscodeTypes.Uri }) => {return d.resource;});
+      this.outputDndLog(`drop: parsed ${uriList.length} uri(s): ${uriList.map((u: any) => `${u?.scheme}:${u?.path ?? u?.fsPath}`).join(', ')}`);
     }
-    let dataObj: any;
-    try {
-      dataObj = JSON.parse(data);
-    } catch (err) {
-      this.outputDndLog(`drop: failed to JSON.parse 'codeeditors': ${String(err)} raw=${data.slice(0, 300)}`);
-      return;
-    }
-    const uriList = dataObj.map((d: { resource: vscodeTypes.Uri }) => {return d.resource;});
-    this.outputDndLog(`drop: parsed ${uriList.length} uri(s): ${uriList.map((u: any) => `${u?.scheme}:${u?.path ?? u?.fsPath}`).join(', ')}`);
 
     const {newGroupId, newIndex} = labelsPanel.dragEndExternal(e, false);
     dragController.markEnded();
@@ -766,6 +797,8 @@ export class VscodeWrapper {
       groupPath: groupPath,
       dropIndex: newIndex,
       resourceUriList: uriList,
+      netlistIdList: netlistIdList,
+      instancePathList: instancePathList,
       uri: viewerState.uri,
       documentId: viewerState.documentId,
     } as WebviewDropMessage);

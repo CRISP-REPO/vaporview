@@ -351,7 +351,12 @@ class VaporviewWebview {
 
     let updateState = false;
 
-    if (controlBar.searchInFocus || labelsPanel.renameActive) {return;} 
+    // Don't hijack keystrokes while typing in a text field (e.g. the signal filter),
+    // otherwise the global preventDefault() below eats every character.
+    const active = document.activeElement as HTMLElement | null;
+    if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable)) {return;}
+
+    if (controlBar.searchInFocus || labelsPanel.renameActive) {return;}
     else {e.preventDefault();}
 
     // debug handler to print the data cache

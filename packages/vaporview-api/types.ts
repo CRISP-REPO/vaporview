@@ -116,6 +116,14 @@ export interface ViewerDropEvent {
   index: number;
 }
 
+export interface DoubleClickSignalEvent {
+  uri: string;
+  netlistId: NetlistId | undefined;
+  scopePath: string[];
+  signalName: string;
+  instancePath: string; // convenience: [...scopePath, signalName].join('.')
+}
+
 // #region Command Argument Types
 
 /** Arguments for `vaporview.openFile` */
@@ -339,4 +347,5 @@ export interface VaporviewApi extends VaporviewCommands {
   onDidRemoveVariable: Event<SignalEvent>;
   onDidClickSignalValueLink: Event<ValueLinkEvent>;
   onDidDropInWaveformViewer: Event<ViewerDropEvent>;
+  onDidDoubleClickSignal: Event<DoubleClickSignalEvent>;
 }

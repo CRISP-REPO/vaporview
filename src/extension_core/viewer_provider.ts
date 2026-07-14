@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { type DocumentId, type NetlistId, SignalGroupWebviewContext, SignalId, StateChangeType, WindowMessageType, type MarkerSetEvent, type SignalEvent, type ViewerDropEvent, ExternalKeyDownMessage, SetDisplayFormatMessage, EmitEventMessage, WebviewDropMessage, DisplayFormatProperties, WebviewStateEvent } from '../common/types';
 import { decodeNetlistUri } from '../../packages/vaporview-api';
-import type { VariableActionArgs, VariableAction, SetMarkerArgs, AddVariableByPathArgs, SavedRowItem, ValueLinkEvent, RulerContext, RulerWebviewContext } from '../../packages/vaporview-api/types';
+import type { VariableActionArgs, VariableAction, SetMarkerArgs, AddVariableByPathArgs, SavedRowItem, ValueLinkEvent, DoubleClickSignalEvent, RulerContext, RulerWebviewContext } from '../../packages/vaporview-api/types';
 import { scaleFromUnits, logScaleFromUnits } from '../common/functions';
 import { Worker } from 'worker_threads';
 import * as fs from 'fs';
@@ -10,7 +10,8 @@ import { VaporviewDocument, NetlistSearchQuickPick, type WaveformFileParser, typ
 import { WasmFormatHandler } from './wasm_handler';
 import { FsdbFormatHandler } from './fsdb_handler';
 import { SurferFormatHandler } from './surfer_handler';
-import { NetlistTreeDataProvider, type NetlistItem, netlistItemDragAndDropController, VaporviewStatusBar } from './tree_view';
+import { NetlistTreeDataProvider, type NetlistItem, VaporviewStatusBar } from './tree_view';
+import { NetlistExplorerPanel } from './netlist_explorer_panel';
 import path from 'path';
 import { dirname } from 'path';
 
@@ -293,7 +294,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
 
   // API endpoints
   public netlistTreeDataProvider: NetlistTreeDataProvider;
-  public netlistView: vscode.TreeView<NetlistItem>;
+  public netlistExplorerPanel: NetlistExplorerPanel;
   public statusBar: VaporviewStatusBar;
 
   // Event emitters
@@ -302,6 +303,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
   public static readonly addVariableEventEmitter = new vscode.EventEmitter<SignalEvent>();
   public static readonly removeVariableEventEmitter = new vscode.EventEmitter<SignalEvent>();
   public static readonly valueLinkEventEmitter = new vscode.EventEmitter<ValueLinkEvent>();
+  public static readonly doubleClickSignalEventEmitter = new vscode.EventEmitter<DoubleClickSignalEvent>();
   public static readonly externalDropEventEmitter = new vscode.EventEmitter<ViewerDropEvent>();
   private readonly _onDidChangeCustomDocument = new vscode.EventEmitter<vscode.CustomDocumentEditEvent<VaporviewDocument>>();
   public readonly onDidChangeCustomDocument = this._onDidChangeCustomDocument.event;
@@ -316,24 +318,13 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     private readonly documentCollection: VaporviewDocumentCollection
   ) {
 
-    // Create and register the Netlist and Displayed Signals view container
+    // The Netlist is now an editor-pane webview (opened beside the waveform),
+    // not a sidebar TreeView. The data provider instance is retained because a few
+    // legacy commands still reference its selection state.
     this.netlistTreeDataProvider = new NetlistTreeDataProvider();
-    this.netlistView = vscode.window.createTreeView('waveformViewerNetlistView', {
-      treeDataProvider: this.netlistTreeDataProvider,
-      manageCheckboxStateManually: true,
-      canSelectMany: true,
-      showCollapseAll: true,
-      dragAndDropController: netlistItemDragAndDropController
-    });
-    this._context.subscriptions.push(this.netlistView);
+    this.netlistExplorerPanel = new NetlistExplorerPanel(this._context, this.log);
 
     this.statusBar = new VaporviewStatusBar(this._context);
-
-    // Subscribe to the View events. We need to subscribe to expand and collapse events
-    // because the collapsible state would not otherwise be preserved when the tree view is refreshed
-    this.netlistView.onDidExpandElement(this.handleNetlistExpandElement);
-    this.netlistView.onDidCollapseElement(this.handleNetlistCollapseElement);
-    this.netlistView.onDidChangeSelection(this.handleNetlistViewSelectionChanged, this, this._context.subscriptions);
 
     this.wasmWorkerFile = vscode.Uri.joinPath(this._context.extensionUri, 'dist', 'worker.js').fsPath;
     this.quickPick = new NetlistSearchQuickPick();
@@ -373,7 +364,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
 
     delegate.updateViews = (uri: vscode.Uri) => {
       if (this.activeDocument?.uri !== uri) {return;}
-      this.netlistTreeDataProvider.loadDocument(document);
+      this.netlistExplorerPanel.setActiveDocument(document);
     };
 
     await document.load();
@@ -676,7 +667,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     if (document.uri.fsPath !== this.activeDocument.uri.fsPath) {return;}
 
     //const settings = document.getSettings();
-    this.netlistTreeDataProvider.hide();
+    this.netlistExplorerPanel.clear();
     await document.reload();
   }
 
@@ -797,6 +788,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
       case 'addVariable':    {WaveformViewerProvider.addVariableEventEmitter.fire(e.eventData as SignalEvent); break;}
       case 'removeVariable': {WaveformViewerProvider.removeVariableEventEmitter.fire(e.eventData as SignalEvent); break;}
       case 'valueLink':      {WaveformViewerProvider.valueLinkEventEmitter.fire(e.eventData as ValueLinkEvent); break;}
+      case 'doubleClickSignal': {WaveformViewerProvider.doubleClickSignalEventEmitter.fire(e.eventData as DoubleClickSignalEvent); break;}
     }
   }
 
@@ -805,14 +797,14 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     this.activeDocument = document;
     this.lastActiveWebview  = webviewPanel;
     this.lastActiveDocument = document;
-    this.netlistTreeDataProvider.loadDocument(document);
+    this.netlistExplorerPanel.setActiveDocument(document);
     document.setSearchCommandContext();
   }
 
   onDidChangeViewStateInactive() {
     this.activeWebview  = undefined;
     this.activeDocument = undefined;
-    this.netlistTreeDataProvider.hide();
+    this.netlistExplorerPanel.clear();
     this.statusBar.hide();
     vscode.commands.executeCommand('setContext', 'vaporview.netlistSearchable', false);
   }
@@ -822,7 +814,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     const document = this.lastActiveDocument;
     const metadata = await document.findTreeItem(signalName, undefined, undefined);
     if (metadata !== null) {
-      this.netlistView.reveal(metadata, {select: true, focus: false, expand: 3});
+      this.netlistExplorerPanel.reveal(metadata.netlistId);
     }
   }
 
@@ -841,7 +833,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     if (netlistId === null || netlistId === undefined) {return;}
     const netlistItem = document.netlistIdTable[netlistId];
     if (netlistItem) {
-      this.netlistView.reveal(netlistItem, {select: true, focus: false, expand: 3});
+      this.netlistExplorerPanel.reveal(netlistId);
     }
   }
 
@@ -964,7 +956,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
         break;
       } 
       case 'reveal': {
-        this.netlistView.reveal(metadata, {select: true, focus: false, expand: 0});
+        this.netlistExplorerPanel.reveal(metadata.netlistId);
         break;
       }
       case "addLink": {
@@ -1011,7 +1003,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     } as ExternalKeyDownMessage);
   }
 
-  private handleWebviewDrop(e: WebviewDropMessage) {
+  private async handleWebviewDrop(e: WebviewDropMessage) {
 
     const _dnd = process.env.CRISP_DEV_DEBUG_DND === '1';
     const dlog = (m: string) => { if (_dnd) {this.log.appendLine('[DND][ext] ' + m);} };
@@ -1019,11 +1011,23 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     const unknownUriList: vscode.Uri[] = [];
     const netlistIdList: NetlistId[] = [];
     const document = this.documentCollection.get(e.documentId);
-    dlog(`handleWebviewDrop documentId=${e.documentId} found=${!!document} uriCount=${e.resourceUriList?.length ?? 0} groupPath=${JSON.stringify(e.groupPath)} dropIndex=${e.dropIndex}`);
+    dlog(`handleWebviewDrop documentId=${e.documentId} found=${!!document} uriCount=${e.resourceUriList?.length ?? 0} netlistIds=${e.netlistIdList?.length ?? 0} paths=${e.instancePathList?.length ?? 0} groupPath=${JSON.stringify(e.groupPath)} dropIndex=${e.dropIndex}`);
     if (!document) {dlog('no document for documentId — aborting'); return;}
-    if (!e.resourceUriList) {dlog('no resourceUriList — aborting'); return;}
 
-    e.resourceUriList.forEach((uri: vscode.Uri, i: number) => {
+    // Netlist Explorer drops carry ids directly (no URI decoding needed).
+    if (e.netlistIdList && e.netlistIdList.length > 0) {
+      e.netlistIdList.forEach((id) => { if (id !== undefined && id !== null) { netlistIdList.push(id); } });
+    }
+
+    // Search-result drops carry instance paths — resolve each to a netlist id.
+    if (e.instancePathList && e.instancePathList.length > 0) {
+      for (const p of e.instancePathList) {
+        const node = await document.findTreeItem(p, undefined, undefined);
+        if (node && node.netlistId !== undefined && node.netlistId !== null) { netlistIdList.push(node.netlistId); }
+      }
+    }
+
+    (e.resourceUriList || []).forEach((uri: vscode.Uri, i: number) => {
       // URIs arrive over postMessage as plain objects; log the raw fields that matter
       // for the Windows-host / Linux-remote path mismatch (scheme, path, fsPath).
       dlog(`  uri[${i}] scheme=${(uri as any)?.scheme} path=${(uri as any)?.path} fsPath=${(() => { try { return (uri as any)?.fsPath; } catch { return '(throws)'; } })()} fragment=${(uri as any)?.fragment}`);
@@ -1126,9 +1130,9 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
       return;
     }
 
-    // If it's a scope item, we just reveal it in the tree view
+    // If it's a scope item, we just reveal it in the netlist explorer
     if (metadata.contextValue === 'netlistScope') {
-      this.netlistView.reveal(metadata, {select: true, focus: false, expand: 0});
+      this.netlistExplorerPanel.reveal(metadata.netlistId);
       return;
     }
 
@@ -1516,25 +1520,4 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
 
     return htmlContent;
   }
-
-  // onDidChangeSelection() event returns readonly elements
-  // so we need to copy the selected elements to a new array
-  // Six one way, half a dozen the other. One is just more concise...
-  private handleNetlistViewSelectionChanged = (e: vscode.TreeViewSelectionChangeEvent<NetlistItem>) => {
-
-    const uri = this.activeDocument?.uri;
-    this.netlistTreeDataProvider.handleSelectionChanged(e, uri);
-  };
-
-  private handleNetlistCollapseElement = (e: vscode.TreeViewExpansionEvent<NetlistItem>) => {
-    if (!this.lastActiveWebview?.visible) {return;}
-    if (e.element.collapsibleState === vscode.TreeItemCollapsibleState.None) {return;}
-    e.element.collapsibleState = vscode.TreeItemCollapsibleState.Collapsed;
-  };
-
-  private handleNetlistExpandElement = (e: vscode.TreeViewExpansionEvent<NetlistItem>) => {
-    if (!this.lastActiveWebview?.visible) {return;}
-    if (e.element.collapsibleState === vscode.TreeItemCollapsibleState.None) {return;}
-    e.element.collapsibleState = vscode.TreeItemCollapsibleState.Expanded;
-  };
 }

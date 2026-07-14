@@ -23,7 +23,7 @@ export type {
   SignalGroupWebviewContext,
 } from '../../packages/vaporview-api/types';
 export { NameType } from '../../packages/vaporview-api/types';
-import type { NetlistId, SignalId, RowId, DocumentId, SignalSeparatorContext, SignalGroupContext, CustomVariableContext, NetlistVariableContext, ValueLinkEvent, SignalEvent, MarkerSetEvent, SavedRowItem } from '../../packages/vaporview-api/types';
+import type { NetlistId, SignalId, RowId, DocumentId, SignalSeparatorContext, SignalGroupContext, CustomVariableContext, NetlistVariableContext, ValueLinkEvent, DoubleClickSignalEvent, SignalEvent, MarkerSetEvent, SavedRowItem } from '../../packages/vaporview-api/types';
 export type ValueChange = [number, string];
 export type EnumEntry   = [string, string];
 export type EnumData    = EnumEntry[];
@@ -139,8 +139,8 @@ export interface ExternalKeyDownMessage {
 
 export interface EmitEventMessage {
   command: 'emitEvent';
-  eventType: 'markerSet' | 'signalSelect' | 'addVariable' | 'removeVariable' | 'valueLink';
-  eventData: MarkerSetEvent | SignalEvent | ValueLinkEvent;
+  eventType: 'markerSet' | 'signalSelect' | 'addVariable' | 'removeVariable' | 'valueLink' | 'doubleClickSignal';
+  eventData: MarkerSetEvent | SignalEvent | ValueLinkEvent | DoubleClickSignalEvent;
 }
 
 export type WebviewStateEvent = {
@@ -176,6 +176,10 @@ export interface WebviewDropMessage {
   groupPath?: string[];
   dropIndex?: number;
   resourceUriList?: vscode.Uri[];
+  // Netlist ids dropped from the Netlist Explorer webview (custom-MIME drag, no Shift).
+  netlistIdList?: NetlistId[];
+  // Instance paths dropped from Netlist Explorer search results (resolved to ids host-side).
+  instancePathList?: string[];
   documentId: DocumentId;
 }
 

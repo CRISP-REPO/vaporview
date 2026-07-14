@@ -48,6 +48,8 @@ export class LabelsPanels {
   dragFreezeTimeout: ReturnType<typeof setTimeout> | null = null;
 
   renameActive: boolean             = false;
+  signalFilterText: string          = '';
+  filteredOutRows: Set<RowId>       = new Set();
   valueAtMarker: Record<number, string[]> = {};
   lastClickedSignal: RowId | null   = null;
   lastClickedTime: number           = 0;
@@ -95,6 +97,16 @@ export class LabelsPanels {
     //valueDisplay.addEventListener('click', (e) => this.clickValueDisplay(e));
     labelsScroll.addEventListener('click', (e) => this.clickLabel(e));
     valuesScroll.addEventListener('click', (e) => this.clickValueDisplay(e));
+    // Waveform-pane signal filter: hide displayed signals whose name doesn't match.
+    const signalFilter = document.getElementById('signal-filter') as HTMLInputElement | null;
+    if (signalFilter) {
+      signalFilter.addEventListener('input', () => {
+        this.signalFilterText = signalFilter.value;
+        this.applyRowFilter();
+        // Re-render waveforms so virtualization bounds skip the now-hidden rows.
+        viewport.renderAllWaveforms(false);
+      });
+    }
     // resize handler to handle column resizing
     resize1.addEventListener("mousedown",   (e) => {this.handleResizeMousedown(e, resize1, 1);});
     resize2.addEventListener("mousedown",   (e) => {this.handleResizeMousedown(e, resize2, 2);});
@@ -124,6 +136,7 @@ export class LabelsPanels {
       this.labelsList.push(netlistData.createLabelElement());
     });
     this.labels.innerHTML = this.labelsList.join('');
+    this.applyRowFilter();
   }
 
   renderValueDisplay() {
@@ -133,6 +146,57 @@ export class LabelsPanels {
       transitions.push(netlistData.createValueDisplayElement());
     });
     this.valueDisplay.innerHTML = transitions.join('');
+    this.applyRowFilter();
+  }
+
+  // Hide displayed signals whose name doesn't match the filter text. Applied across
+  // the three synced columns (labels / values / waveforms) so rows stay aligned. A
+  // group stays visible if its own name matches or any descendant matches. Re-applied
+  // after every label/value/waveform render (re-render recreates the DOM).
+  public applyRowFilter() {
+    const q = this.signalFilterText.trim().toLowerCase();
+    const setHidden = (rowId: RowId, hidden: boolean) => {
+      if (hidden) {this.filteredOutRows.add(rowId);} else {this.filteredOutRows.delete(rowId);}
+      const l = this.labels.querySelector(`#label-${rowId}`);
+      const v = this.valueDisplay.querySelector(`#value-${rowId}`);
+      const w = document.getElementById(`waveform-${rowId}`);
+      if (l) {l.classList.toggle('filtered-out', hidden);}
+      if (v) {v.classList.toggle('filtered-out', hidden);}
+      if (w) {w.classList.toggle('filtered-out', hidden);}
+    };
+
+    if (q === '') {
+      this.filteredOutRows.clear();
+      viewerState.displayedSignalsFlat.forEach((rowId) => setHidden(rowId, false));
+      return;
+    }
+
+    const nameOf = (rowId: RowId): string => {
+      const item = rowHandler.rowItems[rowId];
+      if (item instanceof NetlistVariable) {
+        return [...(item.scopePath || []), item.signalName].join('.');
+      }
+      if (item instanceof CustomVariable) {return (item as any).name ?? '';}
+      if (item instanceof SignalGroup) {return item.label ?? '';}
+      return '';
+    };
+
+    // Returns whether the row (and hence its subtree) is visible under the filter.
+    const decide = (rowId: RowId): boolean => {
+      const item = rowHandler.rowItems[rowId];
+      if (item instanceof SignalGroup) {
+        let anyChild = false;
+        item.children.forEach((childRowId) => { if (decide(childRowId)) {anyChild = true;} });
+        const visible = anyChild || (item.label ?? '').toLowerCase().includes(q);
+        setHidden(rowId, !visible);
+        return visible;
+      }
+      const visible = nameOf(rowId).toLowerCase().includes(q);
+      setHidden(rowId, !visible);
+      return visible;
+    };
+
+    viewerState.displayedSignals.forEach((rowId) => decide(rowId));
   }
 
   clickValueDisplay(event: MouseEvent) {
@@ -167,7 +231,7 @@ export class LabelsPanels {
     } else {
       //this.events.dispatch(ActionType.SignalSelect, [rowId], rowId);
       handleClickSelection(event, rowId);
-      //this.doubleClickLabel(rowId);
+      this.doubleClickLabel(rowId);
     }
   }
 
@@ -178,7 +242,16 @@ export class LabelsPanels {
       this.lastClickedTime   = 0;
       const rowItem          = rowHandler.rowItems[rowId];
       if (rowItem instanceof NetlistVariable) {
-        // emit double click event
+        // Emit a double-click event; the extension host resolves the signal to
+        // its RTL source (KDB or background source index) and opens it.
+        const scopePath = rowItem.scopePath ?? [];
+        vscodeWrapper.emitDoubleClickSignalEvent({
+          uri: viewerState.uri?.toString() || "",
+          netlistId: rowItem.netlistId,
+          scopePath: scopePath,
+          signalName: rowItem.signalName,
+          instancePath: [...scopePath, rowItem.signalName].join('.'),
+        });
       }
     }
     this.lastClickedSignal = rowId;
@@ -446,25 +519,51 @@ export class LabelsPanels {
     });
 
     if (!breakFlag) {
+      // Only real signal/group rows are valid drop anchors — skip the drag-divider
+      // and cursor-tag helper elements (which have no rowId).
+      const realItems = idleItems.filter((it) =>
+        it.classList.contains('is-idle') || it.classList.contains('is-draggable')) as HTMLElement[];
       if (draggableItemY >= groupContainerBox.bottom) {
+        // Below the last row → append to the end.
         dragDividerY = groupContainerBox.bottom - labelsRect.top;
-        this.closestItem = (idleItems[idleItems.length - 1] as HTMLElement) || null;
+        this.closestItem = realItems[realItems.length - 1] || null;
         this.indexOffset = 1;
       } else if (draggableItemY < groupContainerBox.top) {
         dragDividerY = groupContainerBox.top - labelsRect.top;
-        this.closestItem = (idleItems[0] as HTMLElement) || null;
+        this.closestItem = realItems[0] || null;
         this.indexOffset = 0;
-      } else {
+      } else if (this.draggableItem) {
+        // Internal reorder with the pointer in a gap → keep near the dragged row.
         dragDividerY = (this.defaultDragDividerY - this.labelsScroll.scrollTop) - labelsRect.top;
         this.closestItem = this.draggableItem;
         this.indexOffset = 0;
+      } else {
+        // External add (no dragged row) with the pointer inside the list span but not
+        // over a specific row → append to the end. Previously this fell through to a
+        // null closestItem and inserted at index 0, so dropping below the list added
+        // the signal at the TOP instead of the bottom.
+        dragDividerY = groupContainerBox.bottom - labelsRect.top;
+        this.closestItem = realItems[realItems.length - 1] || null;
+        this.indexOffset = 1;
       }
     }
+
+    // Highlight the target row for external (add-signal) drags so the user can see
+    // where the dropped signal will land. (Internal reorders already show the divider.)
+    this.setDropHighlight(this.draggableItem ? null : this.closestItem);
 
     if (this.dragDivider !== null && dragDividerY !== null) {
       this.dragDivider.style.top = `${dragDividerY}px`;
       this.dragDivider.style.left = width + 'px';
     }
+  }
+
+  private dropHighlightItem: HTMLElement | null = null;
+  private setDropHighlight(item: HTMLElement | null) {
+    if (this.dropHighlightItem === item) {return;}
+    if (this.dropHighlightItem) {this.dropHighlightItem.classList.remove('drop-target-highlight');}
+    this.dropHighlightItem = item;
+    if (item) {item.classList.add('drop-target-highlight');}
   }
 
   public getDropIndex() {
@@ -490,6 +589,7 @@ export class LabelsPanels {
   }
 
   clearDragHandler() {
+    this.setDropHighlight(null);
     this.idleItems.forEach((item) => {(item as HTMLElement).style.cssText = '';});
     this.idleItems      = [];
     this.idleGroups     = [];

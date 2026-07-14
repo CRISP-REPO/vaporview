@@ -224,6 +224,10 @@ export function registerVaporviewCommands(
       viewerProvider.showInNetlistView(e);
   }));
 
+  context.subscriptions.push(vscode.commands.registerCommand('vaporview.toggleNetlistExplorer', () => {
+      viewerProvider.netlistExplorerPanel.toggle();
+  }));
+
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.showInViewer', (e: { netlistId: NetlistId }) => {
     viewerProvider.revealSignalInWebview(e.netlistId);
   }));

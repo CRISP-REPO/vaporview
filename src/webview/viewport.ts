@@ -250,17 +250,9 @@ export class Viewport {
   }
 
   addNetlistLink() {
-    this.waveformArea.innerHTML = `
-    <div class="waveform-container" id="netlist-link">
-      <p>Add signals from the </p><p id="netlist-link-text"><u>Netlist View</u></p>
-    </div>`;
-    this.netlistLinkElement = document.getElementById('netlist-link');
-    const linkText = document.getElementById('netlist-link-text');
-    if (linkText) {
-      linkText.addEventListener('click', () => {
-        vscodeWrapper.executeCommand("waveformViewerNetlistView.focus", []);
-      });
-    }
+    // Empty-state placeholder removed: the Netlist / Signal Explorer opens beside
+    // the waveform (auto-open + title-bar button), so the old in-pane "Add signals
+    // from the Netlist View" link (which pointed at the removed sidebar view) is gone.
   }
 
   removeNetlistLink() {
@@ -557,6 +549,12 @@ export class Viewport {
     let bottomBounds   = 0;
 
     viewerState.visibleSignalsFlat.forEach((rowId) => {
+      // Skip rows hidden by the signal filter — their containers are display:none (0
+      // height), so they must not accumulate virtualization bounds either.
+      if (labelsPanel.filteredOutRows.has(rowId)) {
+        rowHandler.rowItems[rowId].wasRendered = false;
+        return;
+      }
       const netlistData = rowHandler.rowItems[rowId];
       const rowHeight   = netlistData.rowHeight * styles.rowHeight;
       topBounds         = bottomBounds;

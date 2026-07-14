@@ -95,6 +95,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Vaporv
   const addVariableEvent = WaveformViewerProvider.addVariableEventEmitter.event;
   const removeVariableEvent = WaveformViewerProvider.removeVariableEventEmitter.event;
   const valueLinkEvent = WaveformViewerProvider.valueLinkEventEmitter.event;
+  const doubleClickSignalEvent = WaveformViewerProvider.doubleClickSignalEventEmitter.event;
   const externalDropEvent = WaveformViewerProvider.externalDropEventEmitter.event;
 
   // Register commands (there are a lot of commands, so we register them in a separate file for cleanliness)
@@ -178,6 +179,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<Vaporv
   // Open source for a given instance path (scope-aware resolution)
   context.subscriptions.push(vscode.commands.registerCommand('vaporview.openSource', async (e) => {
     try {
+      // Prefer the host resolver (Crisp) when present — it adds a Verdi-KDB path
+      // and a background source index. Fall back to the built-in resolution below
+      // when VaporView runs standalone.
+      try {
+        const cmds = await vscode.commands.getCommands(true);
+        if (cmds.includes('crisp.openSignalSource')) {
+          await vscode.commands.executeCommand('crisp.openSignalSource', e);
+          return;
+        }
+      } catch { /* fall through to built-in resolution */ }
       await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'Opening source...', cancellable: false }, async (progress) => {
       // Accept instancePath directly (from dblclick) or derive from webview context (right-click menu)
       let instancePath: string | undefined = e?.instancePath;
@@ -334,6 +345,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<Vaporv
     onDidRemoveVariable: removeVariableEvent,
     onDidDropInWaveformViewer: externalDropEvent,
     onDidClickSignalValueLink: valueLinkEvent,
+    onDidDoubleClickSignal: doubleClickSignalEvent,
 
     // Commands
     async openFile(args: OpenFileArgs) {

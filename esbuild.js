@@ -159,11 +159,23 @@ const webviewConfig = {
   metafile: true, // To analyze bundle
 };
 
+const netlistExplorerConfig = {
+  ...commonConfig,
+  entryPoints: ['src/webview/netlist_explorer/main.ts'],
+  format: 'iife',
+  platform: 'browser',
+  outfile: 'dist/netlist_explorer.js',
+  plugins: [esbuildProblemMatcherPlugin],
+  target: ['es2020'],
+  treeShaking: production,
+};
+
 async function main() {
   try {
     if (watch) {
       const extensionCtx = await esbuild.context(extensionConfig);
       const webviewCtx = await esbuild.context(webviewConfig);
+      const netlistExplorerCtx = await esbuild.context(netlistExplorerConfig);
       const workerCtx = await esbuild.context(workerConfig);
       const fsdbWorkerCtx = await esbuild.context(fsdbWorkerConfig);
       const standaloneHostCtx = await esbuild.context(standaloneHostConfig);
@@ -171,6 +183,7 @@ async function main() {
       await Promise.all([
         extensionCtx.watch(),
         webviewCtx.watch(),
+        netlistExplorerCtx.watch(),
         workerCtx.watch(),
         fsdbWorkerCtx.watch(),
         standaloneHostCtx.watch()
@@ -179,6 +192,7 @@ async function main() {
       await Promise.all([
         esbuild.build(extensionConfig),
         esbuild.build(webviewConfig),
+        esbuild.build(netlistExplorerConfig),
         esbuild.build(workerConfig),
         esbuild.build(fsdbWorkerConfig),
         esbuild.build(standaloneHostConfig)

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Signal Explorer</title>
+  <link rel="stylesheet" href="${webAssets.cssFileUri}">
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    html, body { height: 100%; margin: 0; padding: 0; }
+    body {
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      display: flex; flex-direction: column;
+    }
+    #ne-toolbar {
+      display: flex; gap: 6px; align-items: center;
+      padding: 6px; border-bottom: 1px solid var(--vscode-panel-border);
+      flex: 0 0 auto;
+    }
+    #ne-filter {
+      flex: 1 1 auto; min-width: 0;
+      color: var(--vscode-input-foreground);
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border, transparent);
+      padding: 3px 6px; outline: none;
+    }
+    #ne-add {
+      flex: 0 0 auto;
+      color: var(--vscode-button-foreground);
+      background: var(--vscode-button-background);
+      border: none; padding: 3px 12px; cursor: pointer;
+    }
+    #ne-add:hover { background: var(--vscode-button-hoverBackground); }
+    #ne-add:disabled { opacity: 0.5; cursor: default; }
+    #ne-hint { padding: 4px 8px; opacity: 0.7; font-size: 0.9em; flex: 0 0 auto; }
+    #netlist-explorer-root { flex: 1 1 auto; overflow: auto; user-select: none; }
+    #ne-results { flex: 1 1 auto; overflow: auto; user-select: none; }
+    .ne-empty { padding: 8px; opacity: 0.7; }
+    .ne-row {
+      display: flex; align-items: center; height: 22px; line-height: 22px;
+      white-space: nowrap; cursor: pointer;
+    }
+    .ne-row:hover { background: var(--vscode-list-hoverBackground); }
+    .ne-row.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+    .ne-row.hidden { display: none; }
+    .ne-twist { width: 16px; flex: 0 0 16px; display: inline-flex; align-items: center; justify-content: center; margin-right: 2px; opacity: 0.9; }
+    .ne-twist.leaf { visibility: hidden; }
+    .ne-twist svg { width: 12px; height: 12px; fill: currentColor; transition: transform 0.1s ease; }
+    .ne-twist.expanded svg { transform: rotate(90deg); }
+    .ne-label { overflow: hidden; text-overflow: ellipsis; }
+    .ne-width { opacity: 0.55; margin-left: 6px; font-size: 0.85em; }
+    .ne-children { display: none; }
+    .ne-children.expanded { display: block; }
+  </style>
+</head>
+<body data-vscode-context='{"preventDefaultContextMenuItems":true,"webviewSection":"netlist-explorer"}'>
+  <div id="ne-toolbar">
+    <input id="ne-filter" type="text" placeholder="Search signals…" autocomplete="off" spellcheck="false" />
+    <button id="ne-add" disabled>Add</button>
+  </div>
+  <div id="ne-hint">Open a waveform to browse its signals.</div>
+  <div id="netlist-explorer-root"></div>
+  <div id="ne-results" style="display:none"></div>
+  <script src="${webAssets.jsFileUri}"></script>
+</body>
+</html>
