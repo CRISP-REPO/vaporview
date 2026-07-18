@@ -35,9 +35,6 @@ export class ControlBar {
   private valueEqualsSymbol: HTMLElement;
   private previousButton: HTMLElement;
   private nextButton: HTMLElement;
-  private autoScroll: HTMLElement;
-  private touchScroll: HTMLElement;
-  private mouseScroll: HTMLElement;
   private autoReload: HTMLInputElement;
   settings: HTMLElement;
 
@@ -70,9 +67,6 @@ export class ControlBar {
     this.valueEqualsSymbol = document.getElementById('search-symbol')!;
     this.previousButton = document.getElementById('previous-button')!;
     this.nextButton    = document.getElementById('next-button')!;
-    this.autoScroll    = document.getElementById('auto-scroll-button')!;
-    this.touchScroll   = document.getElementById('touchpad-scroll-button')!;
-    this.mouseScroll   = document.getElementById('mouse-scroll-button')!;
     this.autoReload    = document.getElementById('autoReload') as HTMLInputElement;
     this.settings      = document.getElementById('settings-menu')!;
     this.searchContainer = document.getElementById('search-container')!;
@@ -82,9 +76,8 @@ export class ControlBar {
     if (this.zoomInButton === null || this.zoomOutButton === null || this.zoomFitButton === null || 
         this.prevNegedge === null || this.prevPosedge === null || this.nextNegedge === null || 
         this.nextPosedge === null || this.prevEdge === null || this.nextEdge === null || 
-        this.timeEquals === null || this.valueEquals === null || this.previousButton === null || 
-        this.nextButton === null || this.touchScroll === null || this.mouseScroll === null || 
-        this.autoScroll === null || this.searchContainer === null || this.searchBar === null || 
+        this.timeEquals === null || this.valueEquals === null || this.previousButton === null ||
+        this.nextButton === null || this.searchContainer === null || this.searchBar === null ||
         this.valueIconRef === null ||  this.valueEqualsSymbol === null || this.autoReload === null) {
       throw new Error("Could not find all required elements");
     }
@@ -110,17 +103,11 @@ export class ControlBar {
     this.valueEquals.addEventListener(   'click', () => {this.handleSearchButtonSelect(1);});
     this.previousButton.addEventListener('click', () => {this.handleSearchGoTo(-1);});
     this.nextButton.addEventListener(    'click', () => {this.handleSearchGoTo(1);});
-  
-    // Scroll Type settings
-    this.autoScroll.addEventListener(    'click', () => {this.handleScrollModeClick("Auto");});
-    this.touchScroll.addEventListener(   'click', () => {this.handleScrollModeClick("Touchpad");});
-    this.mouseScroll.addEventListener(   'click', () => {this.handleScrollModeClick("Mouse");});
 
     // Settings menu
     this.settings.addEventListener(      'click', (e: MouseEvent) => {this.clickSettings(e);});
 
     this.setButtonState(this.previousButton, ButtonState.Disabled);
-    this.setButtonState(this.mouseScroll, ButtonState.Selected);
     this.updateNextEdgeButtons([]);
 
     this.handleSignalSelect = this.handleSignalSelect.bind(this);
@@ -160,36 +147,11 @@ export class ControlBar {
     vscodeWrapper.sendWebviewContext(StateChangeType.User);
   }
 
-  handleScrollModeClick(mode: string) {
-    vscodeWrapper.updateConfiguration("scrollingMode", mode);
-  }
-
+  // Applies the `vaporview.scrollingMode` setting (and the palette commands). The old
+  // Mouse/Touchpad/Auto toolbar buttons were removed; scroll mode is config-driven only.
   setScrollMode(mode: string) {
-    switch (mode) {
-      case 'Mouse':    this.handleTouchScroll(false); break;
-      case 'Touchpad': this.handleTouchScroll(true);  break;
-      case 'Auto':     this.handleAutoScroll();       break;
-    }
-  }
-
-  handleTouchScroll(state: boolean) {
-    config.touchpadScrolling = state;
-    config.autoTouchpadScrolling = false;
-    if (state) {
-      this.setButtonState(this.mouseScroll, ButtonState.Enabled);
-      this.setButtonState(this.touchScroll, ButtonState.Selected);
-    } else {
-      this.setButtonState(this.mouseScroll, ButtonState.Selected);
-      this.setButtonState(this.touchScroll, ButtonState.Enabled);
-    }
-    this.setButtonState(this.autoScroll, ButtonState.Enabled);
-  }
-
-  handleAutoScroll() {
-    config.autoTouchpadScrolling = true;
-    this.setButtonState(this.mouseScroll, ButtonState.Enabled);
-    this.setButtonState(this.touchScroll, ButtonState.Enabled);
-    this.setButtonState(this.autoScroll, ButtonState.Selected);
+    config.autoTouchpadScrolling = mode === 'Auto';
+    config.touchpadScrolling     = mode === 'Touchpad';
   }
 
   clickSettings(e: MouseEvent) {
@@ -297,28 +259,24 @@ export class ControlBar {
   handleSearchBarEntry(event: KeyboardEvent | { key: string }) {
     const inputText  = this.searchBar.value;
     let inputValid   = true;
-    //console.log(viewerState.selectedSignal);
-    //console.log(this.searchState);
-    if (viewerState.selectedSignal.length === 1) {
-      const rowId  = viewerState.selectedSignal[0];
-      const rowItem = rowHandler.rowItems[rowId];
-      if (rowItem instanceof NetlistVariable || rowItem instanceof CustomVariable) {
-        const format = rowItem.valueFormat;
-        const checkValidSearch = format.checkValidSearch;
-        const parseValue = format.parseSearchValue;
+    this.parsedSearchValue = null;
 
-        // check to see that the input is valid
-        if (this.searchState === SearchState.Time) {
-          inputValid = this.checkValidTimeString(inputText);
-        } else if (this.searchState === SearchState.Value) {
-          inputValid = checkValidSearch(inputText);
-          if (inputValid) {this.parsedSearchValue = parseValue(inputText);}
-          //console.log(inputValid);
-          //console.log(this.parsedSearchValue);
+    if (this.searchState === SearchState.Time) {
+      // Go-to-time needs no selected signal — it just moves the marker.
+      inputValid = this.checkValidTimeString(inputText);
+    } else if (this.searchState === SearchState.Value) {
+      // Value search needs exactly one variable selected (to know its format/data).
+      inputValid = false;
+      if (viewerState.selectedSignal.length === 1) {
+        const rowItem = rowHandler.rowItems[viewerState.selectedSignal[0]];
+        if (rowItem instanceof NetlistVariable || rowItem instanceof CustomVariable) {
+          const format = rowItem.valueFormat;
+          inputValid = format.checkValidSearch(inputText);
+          if (inputValid) {this.parsedSearchValue = format.parseSearchValue(inputText);}
         }
       }
     }
-  
+
     // Update UI accordingly
     if (inputValid || inputText === '') {
       this.searchContainer.classList.remove('is-invalid');
@@ -336,49 +294,52 @@ export class ControlBar {
   }
   
   handleSearchGoTo(direction: number) {
-    if (viewerState.selectedSignal.length !== 1) {return;}
     if (this.parsedSearchValue === null) {return;}
-    let startTime = viewerState.markerTime;
     let updateState = false;
-    if (startTime === null) {startTime = 0;}
-  
-    const rowId  = viewerState.selectedSignal[0];
-    const rowItem = rowHandler.rowItems[rowId];
+
+    // Go to a time value — no signal selection required.
+    if (this.searchState === SearchState.Time) {
+      if (direction === 1) {
+        this.events.markerSet(parseInt(this.parsedSearchValue), 0, false);
+        updateState = true;
+      }
+      if (updateState) {vscodeWrapper.sendWebviewContext(StateChangeType.User);}
+      return;
+    }
+
+    // Value search — find the next/previous transition matching the entered value on
+    // the selected signal.
+    if (viewerState.selectedSignal.length !== 1) {return;}
+    const startTime = viewerState.markerTime ?? 0;
+    const rowItem = rowHandler.rowItems[viewerState.selectedSignal[0]];
     if (rowItem === undefined || !(rowItem instanceof NetlistVariable) && !(rowItem instanceof CustomVariable)) {return;}
     const data = rowItem.getWaveformData();
     if (data === undefined) {return;}
     const format   = rowItem.valueFormat;
     const checkSearchValue = format.checkSearchValue;
-  
-    if (this.searchState === SearchState.Time && direction === 1) {
-      this.events.markerSet(parseInt(this.parsedSearchValue), 0, false);
-      updateState = true;
-    } else {
-      const signalWidth     = data.signalWidth;
-      //if (this.parsedSearchValue.length > signalWidth) {trimmedSearchValue = this.parsedSearchValue.slice(-1 * signalWidth);}
 
-      const valueChangeData = data.valueChangeData;
-      const formattedData   = data.formattedValues;
-      if (!formattedData[format.id]) {return;}
-      if (!formattedData[format.id].formatCached) {return;}
-      if (!formattedData[format.id].values) {return;}
-      const formattedValues = formattedData[format.id].values;
-      const timeIndex = data.valueChangeData.findIndex(([t, v]) => {return t >= startTime;});
-      let indexOffset = 0;
-  
-      if (direction === -1) {indexOffset = -1;}
-      else if (viewerState.markerTime === valueChangeData[timeIndex][0]) {indexOffset = 1;}
-  
-      for (let i = timeIndex + indexOffset; i >= 0; i+=direction) {
-        if (checkSearchValue(this.parsedSearchValue, valueChangeData[i][1], formattedValues[i])) {
-          this.events.markerSet(valueChangeData[i][0], 0, false);
-          updateState = true;
-          break;
-        }
+    const valueChangeData = data.valueChangeData;
+    const formattedData   = data.formattedValues;
+    if (!formattedData[format.id]) {return;}
+    if (!formattedData[format.id].formatCached) {return;}
+    if (!formattedData[format.id].values) {return;}
+    const formattedValues = formattedData[format.id].values;
+    let timeIndex = valueChangeData.findIndex(([t]) => {return t >= startTime;});
+    // No transition at/after the marker → start from the last one when searching back.
+    if (timeIndex === -1) {timeIndex = valueChangeData.length - 1;}
+    let indexOffset = 0;
+
+    if (direction === -1) {indexOffset = -1;}
+    else if (viewerState.markerTime === valueChangeData[timeIndex]?.[0]) {indexOffset = 1;}
+
+    for (let i = timeIndex + indexOffset; i >= 0 && i < valueChangeData.length; i += direction) {
+      if (checkSearchValue(this.parsedSearchValue, valueChangeData[i][1], formattedValues[i])) {
+        this.events.markerSet(valueChangeData[i][0], 0, false);
+        updateState = true;
+        break;
       }
     }
     if (updateState) {
-      //console.log('handleSearchGoTo');
       vscodeWrapper.sendWebviewContext(StateChangeType.User);
     }
   }
