@@ -473,7 +473,10 @@ export class VscodeWrapper {
       case 'setDisplayFormat':      {rowHandler.setDisplayFormat(message, false); break;}
       case 'renameSignalGroup':     {rowHandler.renameSignalGroup(message.rowId, message.groupName); break;}
       case 'editSignalGroup':       {rowHandler.editSignalGroup(message); break;}
-      case 'remove-signal':         {rowHandler.removeVariable(message.netlistId, message.rowId, message.removeAllSelected); break;}
+      // rowId/netlistId may be omitted by hosts without row bookkeeping
+      // (Crisp Desktop): fall back to the current selection, like
+      // setDisplayFormat does.
+      case 'remove-signal':         {rowHandler.removeVariable(message.netlistId, message.rowId ?? (message.netlistId === undefined ? viewerState.selectedSignal[0] : undefined), message.removeAllSelected); break;}
       case 'remove-group':          {rowHandler.removeSignalGroup(message.groupId, message.recursive); break;}
       case 'remove-separator':      {rowHandler.removeVariable(undefined, message.rowId, message.removeAllSelected); break;}
       case 'update-waveform-chunk': {dataManager.updateWaveformChunk(message); break;}
@@ -486,9 +489,18 @@ export class VscodeWrapper {
       case 'setViewportRange':      {viewport.setViewportRange(message.startTime, message.endTime); break;}
       case 'updateRulerSettings':   {this.handleUpdateRuler(message.units, message.pixelTime); break;}
       case 'setSelectedSignal':     {this.setSelectedSignal(message.netlistId); break;}
+      case 'selectAll':             {events.signalSelect(viewerState.displayedSignalsFlat, null); break;}
       case 'copyWaveDrom':          {copyWaveDrom(); break;}
-      case 'copyValueAtMarker':     {labelsPanel.copyValueAtMarker(message.rowId); break;}
+      case 'copyValueAtMarker':     {labelsPanel.copyValueAtMarker(message.rowId ?? viewerState.selectedSignal[0]); break;}
       case 'updateColorPalette':    {styles.updateColorPalette(message.colorPalette, message.errorColorPalette, message.themeValid); break;}
+      // Crisp desktop native drag: the Qt overlay forwards drag positions so
+      // vaporview's own external-drag divider tracks the insertion point, and
+      // the drop rides the same handleDrop path as a VSCode TreeView drop.
+      // (QtWebEngine delivers dragover but not drop for in-process drags, so
+      // the desktop cannot rely on the HTML5 drop event.)
+      case 'crispDragMove':         {labelsPanel.dragMoveExternal({clientX: message.x, clientY: message.y} as MouseEvent); break;}
+      case 'crispDragLeave':        {if (dragController.isActive) {dragController.cancel(null);} break;}
+      case 'crispDrop':             {this.handleCrispDrop(Array.isArray(message.crispSignals) ? message.crispSignals : []); break;}
       default:                      {this.outputLog('Unknown webview message type: ' + message.command); break;}
     }
   }
@@ -733,10 +745,11 @@ export class VscodeWrapper {
     let netlistIdList: number[] | undefined;
     let instancePathList: string[] | undefined;
 
-    // Preferred path: a drag from the Netlist Explorer webview carries a custom MIME
-    // with the netlist ids (tree rows) or instance paths (search results) directly.
-    // This is plain HTML5 DnD (not the tree's 'codeeditors' resource drag), so it
-    // needs NO Shift key.
+    // Preferred path: a drag from the Netlist Explorer webview (or the Crisp
+    // desktop's native netlist tree) carries a custom MIME with the netlist ids
+    // (tree rows) or instance paths (search results) directly. This is plain
+    // HTML5 DnD (not the tree's 'codeeditors' resource drag), so it needs NO
+    // Shift key.
     const netlistData = e.dataTransfer.getData('application/x-vaporview-netlist');
     if (netlistData) {
       try {
@@ -775,9 +788,49 @@ export class VscodeWrapper {
     const {newGroupId, newIndex} = labelsPanel.dragEndExternal(e, false);
     dragController.markEnded();
 
-    // get the group path for the new group id
+    vscode.postMessage({
+      command: 'handleDrop',
+      groupPath: this.groupPathForGroupId(newGroupId),
+      dropIndex: newIndex,
+      resourceUriList: uriList,
+      netlistIdList: netlistIdList,
+      instancePathList: instancePathList,
+      uri: viewerState.uri,
+      documentId: viewerState.documentId,
+    } as WebviewDropMessage);
+  }
+
+  /** Finish a Crisp-desktop bridged drop. QtWebEngine delivers dragover but
+   *  never the HTML5 drop for in-process drags, so the Qt overlay posts a
+   *  crispDrop message with the dragged items instead; this reads the divider
+   *  position, ends the external drag session, and hands the signals to the
+   *  host in the same handleDrop shape as a direct webview drop. */
+  private handleCrispDrop(items: {netlistId?: number; instancePath?: string}[]) {
+    const {newGroupId, newIndex} = labelsPanel.dragEndExternal(null, false);
+    dragController.markEnded();
+    this.outputDndLog(`crispDrop: ${items.length} item(s) groupId=${newGroupId} index=${newIndex}`);
+    if (items.length === 0) {return;}
+    const netlistIdList = items
+      .filter((i) => i.netlistId !== undefined && i.netlistId !== null)
+      .map((i) => i.netlistId as number);
+    const instancePathList = items
+      .filter((i) => (i.netlistId === undefined || i.netlistId === null) && !!i.instancePath)
+      .map((i) => i.instancePath as string);
+    vscode.postMessage({
+      command: 'handleDrop',
+      groupPath: this.groupPathForGroupId(newGroupId),
+      dropIndex: newIndex,
+      netlistIdList: netlistIdList,
+      instancePathList: instancePathList,
+      uri: viewerState.uri,
+      documentId: viewerState.documentId,
+    } as WebviewDropMessage);
+  }
+
+  /** Labels of the group chain containing `groupId` (empty at top level). */
+  private groupPathForGroupId(groupId: number): string[] {
     let groupPath: string[] = [];
-    const groupRowId = rowHandler.groupIdTable[newGroupId];
+    const groupRowId = rowHandler.groupIdTable[groupId];
     if (groupRowId || groupRowId === 0) {
       groupPath = getParentGroupIdList(groupRowId).map((id) => {
         const item = rowHandler.rowItems[rowHandler.groupIdTable[id]];
@@ -791,16 +844,6 @@ export class VscodeWrapper {
         groupPath.push(groupItem.label);
       }
     }
-
-    vscode.postMessage({
-      command: 'handleDrop',
-      groupPath: groupPath,
-      dropIndex: newIndex,
-      resourceUriList: uriList,
-      netlistIdList: netlistIdList,
-      instancePathList: instancePathList,
-      uri: viewerState.uri,
-      documentId: viewerState.documentId,
-    } as WebviewDropMessage);
+    return groupPath;
   }
 }

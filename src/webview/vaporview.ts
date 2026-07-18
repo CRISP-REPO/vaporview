@@ -146,6 +146,11 @@ export function handleClickSelection(event: MouseEvent, rowId: RowId) {
     } else {
       newSelection = viewerState.selectedSignal.concat([rowId]);
     }
+  } else if (viewerState.selectedSignal.includes(rowId)) {
+    // Plain click on an already-selected row keeps the whole selection intact so
+    // drag-and-drop of the row (or a multi-selection) is never interrupted. To
+    // deselect, click an unselected row, or press Ctrl/Cmd+A to toggle all off.
+    newSelection = viewerState.selectedSignal;
   } else {
     newSelection = [rowId];
   }
@@ -415,7 +420,16 @@ class VaporviewWebview {
     else if (e.key === 'a' && (e.ctrlKey || e.metaKey) && !controlBar.searchInFocus && !labelsPanel.renameActive) {
       e.preventDefault();
       controlBar.defocusSearchBar();
-      this.events.signalSelect(viewerState.displayedSignalsFlat, null);
+      // Ctrl/Cmd+A toggles: select all, then deselect all when everything is
+      // already selected. This is the primary way to clear a selection now that
+      // plain clicks no longer deselect.
+      const allRows = viewerState.displayedSignalsFlat;
+      const allSelected = allRows.length > 0 && allRows.every(id => viewerState.selectedSignal.includes(id));
+      if (allSelected) {
+        rowHandler.deselectAllSignals();
+      } else {
+        this.events.signalSelect(allRows, null);
+      }
       updateState = true;
     }
 

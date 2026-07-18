@@ -176,7 +176,8 @@ export interface WebviewDropMessage {
   groupPath?: string[];
   dropIndex?: number;
   resourceUriList?: vscode.Uri[];
-  // Netlist ids dropped from the Netlist Explorer webview (custom-MIME drag, no Shift).
+  // Netlist ids dropped from the Netlist Explorer webview (custom-MIME drag, no
+  // Shift) — the Crisp desktop's native netlist tree posts the same fields.
   netlistIdList?: NetlistId[];
   // Instance paths dropped from Netlist Explorer search results (resolved to ids host-side).
   instancePathList?: string[];

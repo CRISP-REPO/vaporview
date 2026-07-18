@@ -23,6 +23,9 @@
  */
 import { createInterface } from "readline";
 import { readFile } from "fs/promises";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { createHash } from "crypto";
+import * as os from "os";
 import * as nodePath from "path";
 
 import { Uri } from "./vscodeShims";
@@ -45,11 +48,13 @@ function logErr(message: string): void {
 	process.stderr.write(message + "\n");
 }
 
-function parseArgs(argv: string[]): { file?: string } {
-	const out: { file?: string } = {};
+function parseArgs(argv: string[]): { file?: string; stateDir?: string } {
+	const out: { file?: string; stateDir?: string } = {};
 	for (let i = 0; i < argv.length; i++) {
 		if (argv[i] === "--file") {
 			out.file = argv[++i];
+		} else if (argv[i] === "--state-dir") {
+			out.stateDir = argv[++i];
 		}
 	}
 	return out;
@@ -61,11 +66,39 @@ async function main() {
 	console.log = ((...a: unknown[]) => logErr(a.map(String).join(" "))) as typeof console.log;
 	console.info = console.log;
 
-	const { file } = parseArgs(process.argv.slice(2));
+	const { file, stateDir: stateDirArg } = parseArgs(process.argv.slice(2));
 	if (!file) {
 		logErr("standalone-host: missing --file <path>");
 		process.exit(2);
 	}
+
+	// --- Per-file viewer-session persistence ---------------------------------
+	// The webview streams its full context (displayed signals, marker, zoom,
+	// scroll) on every state change; VS Code keeps it via vscode.setState +
+	// sidecar-side session files. Standalone: persist the latest context under
+	// stateDir keyed by the dump's absolute path, and feed it back through
+	// document.applySettings() when the webview asks to restoreState.
+	const stateDir = stateDirArg ?? nodePath.join(os.tmpdir(), "crisp-waveform-states");
+	const stateFile = nodePath.join(
+		stateDir,
+		createHash("sha1").update(nodePath.resolve(file)).digest("hex").slice(0, 16) + ".json");
+	let lastContext: Record<string, unknown> | undefined;
+	let saveTimer: ReturnType<typeof setTimeout> | undefined;
+	const flushState = () => {
+		if (!lastContext) {
+			return;
+		}
+		try {
+			mkdirSync(stateDir, { recursive: true });
+			writeFileSync(stateFile, JSON.stringify(lastContext));
+		} catch (e) {
+			logErr(`standalone-host: viewer-state save failed: ${e instanceof Error ? e.message : e}`);
+		}
+	};
+	process.on("SIGTERM", () => {
+		flushState();
+		process.exit(0);
+	});
 
 	const uri = Uri.file(file);
 	const fileType = nodePath.extname(file).slice(1).toLowerCase();
@@ -239,6 +272,52 @@ async function main() {
 				);
 				break;
 			}
+			// Editor annotation: resolve leaf signal names in the netlist, then
+			// fetch their values at `time`. One reply per request; names cap
+			// keeps the per-name wasm searches bounded.
+			case "annotateValues": {
+				const requestId = e.requestId;
+				const time = Number(e.time) || 0;
+				const names = Array.isArray(e.names) ? (e.names as unknown[]).slice(0, 150).map(String) : [];
+				(async () => {
+					const nameForPath = new Map<string, string>();
+					for (const name of names) {
+						try {
+							const res = await document.searchNetlist(name, undefined);
+							// eslint-disable-next-line @typescript-eslint/no-explicit-any
+							const hits = (res.searchResults as any[]) ?? [];
+							let best: string | undefined;
+							for (const h of hits) {
+								const p = String(h.instancePath ?? "");
+								if ((p.split(".").pop() ?? "") !== name) continue;
+								if (!best || p.length < best.length) best = p; // prefer top-most
+							}
+							if (best && !nameForPath.has(best)) nameForPath.set(best, name);
+						} catch {
+							/* unresolvable name — skip */
+						}
+					}
+					const paths = [...nameForPath.keys()];
+					const values = paths.length
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						? await (document as any).getValuesAtTime({ time, instancePaths: paths })
+						: []
+					emit({
+						command: "annotationValues",
+						requestId,
+						time,
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						items: (values as any[]).map((v) => ({
+							name: nameForPath.get(v.instancePath) ?? v.instancePath,
+							instancePath: v.instancePath,
+							value: Array.isArray(v.value) ? v.value[v.value.length - 1] : v.value,
+						})),
+					});
+				})().catch((err) =>
+					logErr(`standalone-host: annotateValues failed: ${err instanceof Error ? err.message : err}`),
+				);
+				break;
+			}
 			// Display a variable in the waveform (the desktop tree's double-click).
 			// Accepts a netlistId (browse tree) or an instancePath (search hits,
 			// which don't carry ids — resolved via findTreeItem).
@@ -274,15 +353,89 @@ async function main() {
 				);
 				break;
 			}
+			// Viewer-session persistence: cache every context update (debounced
+			// to disk), and answer the webview's load-time restore request with
+			// the saved settings — document.applySettings resolves the signal
+			// list against the freshly parsed netlist, exactly like VS Code's
+			// StateChangeType.Restore path.
+			case "contextUpdate": {
+				const ctx: Record<string, unknown> = { ...e };
+				delete ctx.command;
+				lastContext = ctx;
+				if (saveTimer) {
+					clearTimeout(saveTimer);
+				}
+				saveTimer = setTimeout(flushState, 500);
+				break;
+			}
+			case "restoreState": {
+				try {
+					let saved: Record<string, unknown> | undefined;
+					if (existsSync(stateFile)) {
+						saved = JSON.parse(readFileSync(stateFile, "utf8"));
+					} else {
+						// vaporview's session convention: a sibling <dump>.json.
+						const sibling = file.replace(/\.[^.]+$/, "") + ".json";
+						if (existsSync(sibling)) {
+							saved = JSON.parse(readFileSync(sibling, "utf8"));
+							logErr(`standalone-host: loading session from ${sibling}`);
+						}
+					}
+					if (saved) {
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						(document as any).applySettings(saved, 1 /* StateChangeType.Restore */, false);
+					}
+				} catch (err) {
+					logErr(`standalone-host: viewer-state restore failed: ${err instanceof Error ? err.message : err}`);
+				}
+				break;
+			}
+			// Drop from the desktop's native netlist tree: the webview computed
+			// the divider position (dropIndex within groupPath) and passes ids /
+			// instance paths through (the extension's WebviewDropMessage shape) —
+			// resolve paths to ids and render at exactly that spot, the same
+			// renderSignals call the VSCode extension makes.
+			case "handleDrop": {
+				(async () => {
+					const ids: number[] = Array.isArray(e.netlistIdList)
+						? (e.netlistIdList as number[]).filter((id) => typeof id === "number")
+						: [];
+					const paths = Array.isArray(e.instancePathList) ? (e.instancePathList as string[]) : [];
+					for (const path of paths) {
+						if (typeof path !== "string" || !path) {
+							continue;
+						}
+						const item = await document.findTreeItem(path, undefined, undefined);
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						const netlistId = (item as any)?.netlistId;
+						if (typeof netlistId === "number") {
+							ids.push(netlistId);
+						}
+					}
+					if (ids.length > 0) {
+						const groupPath = Array.isArray(e.groupPath) ? (e.groupPath as string[]) : undefined;
+						const index = typeof e.dropIndex === "number" ? (e.dropIndex as number) : undefined;
+						await document.renderSignals(ids, groupPath, index);
+					}
+				})().catch((err) =>
+					logErr(`standalone-host: handleDrop failed: ${err instanceof Error ? err.message : err}`),
+				);
+				break;
+			}
+			// DnD diagnostics from the webview — stderr when debugging is on.
+			case "logDnd":
+				if (process.env.CRISP_DEV_DEBUG_DND === "1") {
+					logErr(`[DND] ${String(e.message)}`);
+				}
+				break;
 			// Host-side concerns that don't apply standalone — accept and ignore.
+			// (copyToClipboard/showMessage are handled by the desktop app, which
+			// taps them off the webview channel before they reach this process.)
 			case "showMessage":
 			case "copyToClipboard":
 			case "executeCommand":
 			case "updateConfiguration":
-			case "restoreState":
-			case "contextUpdate":
 			case "emitEvent":
-			case "handleDrop":
 			case "close-webview":
 				break;
 			default:
@@ -290,7 +443,10 @@ async function main() {
 		}
 	});
 
-	rl.on("close", () => process.exit(0));
+	rl.on("close", () => {
+		flushState(); // tab close / app quit — persist the final viewer state
+		process.exit(0);
+	});
 }
 
 main().catch((e) => {

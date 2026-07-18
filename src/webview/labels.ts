@@ -1,4 +1,4 @@
-import { viewport, viewerState, dataManager, getChildrenByGroupId, getIndexInGroup, handleClickSelection, rowHandler, vscodeWrapper, styles, dragController} from './vaporview';
+import { viewport, viewerState, dataManager, getChildrenByGroupId, getIndexInGroup, handleClickSelection, rowHandler, vscodeWrapper, styles, dragController, events} from './vaporview';
 import { ActionType, type EventHandler } from './event_handler';
 import { ValueFormat } from './value_format';
 import { getParentGroupId } from './vaporview';
@@ -44,6 +44,7 @@ export class LabelsPanels {
   defaultDragDividerY: number       = 0;
   dragActive: boolean               = false;
   dragInProgress: boolean           = false;
+  dragEndedAt: number               = 0;
   dragFreeze: boolean               = true;
   dragFreezeTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -214,6 +215,7 @@ export class LabelsPanels {
 
   clickLabel(event: MouseEvent) {
     if (this.dragInProgress) {return;}
+    if (Date.now() - this.dragEndedAt < 250) {return;} // click synthesized by a finished drag
     if (this.renameActive) {return;}
     const clickedLabel = (event.target as HTMLElement)?.closest('.waveform-label') as HTMLElement | null;
     const rowId = this.getRowIdFromElement(clickedLabel);
@@ -253,6 +255,7 @@ export class LabelsPanels {
           instancePath: [...scopePath, rowItem.signalName].join('.'),
         });
       }
+      return;
     }
     this.lastClickedSignal = rowId;
     this.lastClickedTime   = time;
@@ -590,6 +593,12 @@ export class LabelsPanels {
 
   clearDragHandler() {
     this.setDropHighlight(null);
+    // The browser fires a `click` on the grabbed label AFTER mouseup — by
+    // then dragInProgress is already false, so clickLabel can't tell it from
+    // a real click; stamp the drag end so clickLabel can swallow it.
+    if (this.dragInProgress) {
+      this.dragEndedAt = Date.now();
+    }
     this.idleItems.forEach((item) => {(item as HTMLElement).style.cssText = '';});
     this.idleItems      = [];
     this.idleGroups     = [];
@@ -804,8 +813,13 @@ export class LabelsPanels {
     if (this.dragDivider) {this.dragDivider.style.display = 'none';}
     //if (rowIdList.length === 0) {return;}
 
-    viewerState.displayedSignalsFlat.forEach((rowId) => {
-      this.selectRowId(rowId, false);
+    // Clear EVERY row item, not just displayedSignalsFlat — restore/reorder
+    // can leave that list stale, and the panels re-render from isSelected,
+    // so a missed item stays highlighted forever (even after deselection).
+    rowHandler.rowItems.forEach((item) => {
+      if (item) {
+        item.isSelected = false;
+      }
     });
 
     rowIdList.forEach((rowId) => {

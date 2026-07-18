@@ -651,16 +651,14 @@ export class Viewport {
 
   handleSignalSelect(rowIdList: RowId[], lastSelected: RowId | null) {
 
-    viewerState.selectedSignal.forEach((rowId) => {
-      const element = document.getElementById('waveform-' + rowId);
-      if (element) {
-        element.classList.remove('is-selected');
-      }
-    });
-    if (viewerState.lastSelectedSignal !== null) {
-      const element = document.getElementById('waveform-' + viewerState.lastSelectedSignal);
-      if (element) {element.classList.remove('last-selected');}
-    }
+    // Clear by DOM query, not by iterating viewerState.selectedSignal: another
+    // subscriber may already have overwritten that state (subscriber order),
+    // and restore/reorder paths can leave classes no state list remembers —
+    // stale highlights survived deselection otherwise.
+    document.querySelectorAll('[id^="waveform-"].is-selected')
+      .forEach((element) => element.classList.remove('is-selected'));
+    document.querySelectorAll('[id^="waveform-"].last-selected')
+      .forEach((element) => element.classList.remove('last-selected'));
 
     rowIdList.forEach((rowId) => {
       const element = document.getElementById('waveform-' + rowId);
