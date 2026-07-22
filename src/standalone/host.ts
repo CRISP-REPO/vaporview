@@ -32,6 +32,7 @@ import { Uri } from "./vscodeShims";
 import { WasmFormatHandler } from "../extension_core/wasm_handler";
 import { FsdbFormatHandler } from "../extension_core/fsdb_handler";
 import { VaporviewDocument } from "../extension_core/document";
+import { activeTraceStep, makeRtlScanCache, toHexIfBinary, type RtlScanCache, type TraceBackend } from "@crisp/core/trace";
 
 /** Default signal colour palette (the webview falls back to these when no VSCode theme is available). */
 const DEFAULT_COLOR_PALETTE = [
@@ -204,6 +205,51 @@ async function main() {
 		isScope: (item.collapsibleState ?? 0) !== 0,
 	});
 
+	// Instance paths currently displayed in the viewer, from the last webview
+	// context stream (groups are recursive). Used to avoid re-adding a signal on
+	// an active-trace hop when it is already shown.
+	const displayedInstancePaths = (): Set<string> => {
+		const out = new Set<string>();
+		const walk = (items: unknown) => {
+			if (!Array.isArray(items)) return;
+			for (const it of items as Array<Record<string, unknown>>) {
+				if (!it || typeof it !== "object") continue;
+				if (it.dataType === "netlist-variable" && typeof it.name === "string") out.add(it.name);
+				else if (it.dataType === "signal-group") walk(it.children);
+			}
+		};
+		walk((lastContext as Record<string, unknown> | undefined)?.displayedSignals);
+		return out;
+	};
+
+	// Active-trace RTL scan cache: reused across hops (bounded staleness — an RTL
+	// edit is picked up on the next rebuild after the TTL lapses).
+	const RTL_CACHE_TTL_MS = 30_000;
+	let rtlCacheEntry: { cwd: string; builtAt: number; cache: RtlScanCache } | undefined;
+
+	// The tracer's waveform primitives, backed by the OPEN document — the same
+	// value reads and netlist search the viewer itself uses.
+	const traceBackend: TraceBackend = {
+		async valuesAt(time, paths) {
+			if (!paths.length) return [];
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const values = await (document as any).getValuesAtTime({ time, instancePaths: paths });
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			return (values as any[]).map((v) => {
+				const scalar = Array.isArray(v.value) ? v.value[v.value.length - 1] : v.value;
+				return { instancePath: String(v.instancePath), value: scalar, valueHex: toHexIfBinary(scalar) };
+			});
+		},
+		async searchSignals(fragment) {
+			const res = await document.searchNetlist(fragment, undefined);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			return ((res.searchResults as any[]) ?? [])
+				.filter((h) => !h.isScope)
+				.map((h) => String(h.instancePath ?? ""))
+				.filter(Boolean);
+		},
+	};
+
 	logErr(`standalone-host: parsed ${file} (${fileType}); waiting for webview ready`);
 
 	const rl = createInterface({ input: process.stdin });
@@ -320,21 +366,63 @@ async function main() {
 			}
 			// Display a variable in the waveform (the desktop tree's double-click).
 			// Accepts a netlistId (browse tree) or an instancePath (search hits,
-			// which don't carry ids — resolved via findTreeItem).
+			// which don't carry ids — resolved via findTreeItem). With select:true
+			// (active-trace hop) the signal is only added when not already shown,
+			// and the viewer selection is moved to it either way.
 			case "addVariable": {
 				(async () => {
 					let netlistId = typeof e.netlistId === "number" ? (e.netlistId as number) : undefined;
-					if (netlistId === undefined && typeof e.instancePath === "string") {
-						const item = await document.findTreeItem(e.instancePath as string, undefined, undefined);
+					const instancePath = typeof e.instancePath === "string" ? (e.instancePath as string) : undefined;
+					if (netlistId === undefined && instancePath) {
+						const item = await document.findTreeItem(instancePath, undefined, undefined);
 						// eslint-disable-next-line @typescript-eslint/no-explicit-any
 						netlistId = (item as any)?.netlistId;
 					}
-					if (typeof netlistId === "number") {
+					if (typeof netlistId !== "number") {
+						return;
+					}
+					const select = e.select === true;
+					const alreadyShown = select && instancePath ? displayedInstancePaths().has(instancePath) : false;
+					if (!alreadyShown) {
 						await document.renderSignals([netlistId], undefined, undefined);
+					}
+					if (select) {
+						emit({ command: "setSelectedSignal", netlistId });
 					}
 				})().catch((err) =>
 					logErr(`standalone-host: addVariable failed: ${err instanceof Error ? err.message : err}`),
 				);
+				break;
+			}
+			// One interactive value-trace hop (desktop "Active trace" menu): find
+			// the RTL driver(s) of the signal at `time`, probe their values in the
+			// open waveform, and report either the unique active driver or the
+			// full candidate list. Pure code — no agent involved. The RTL scan
+			// cache (tree walk + file contents) is shared across hops for 30s so a
+			// click-chain re-walks the source tree at most every 30s, not per hop.
+			case "activeTrace": {
+				const requestId = e.requestId;
+				const instancePath = String(e.instancePath ?? "");
+				const time = Number(e.time) || 0;
+				const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+				(async () => {
+					const now = Date.now();
+					if (!rtlCacheEntry || rtlCacheEntry.cwd !== cwd || now - rtlCacheEntry.builtAt > RTL_CACHE_TTL_MS) {
+						rtlCacheEntry = { cwd, builtAt: now, cache: makeRtlScanCache() };
+					}
+					const result = await activeTraceStep(traceBackend, { start: instancePath, time, cwd, cache: rtlCacheEntry.cache });
+					emit({ command: "activeTraceResult", requestId, ...result });
+				})().catch((err) => {
+					logErr(`standalone-host: activeTrace(${instancePath}) failed: ${err instanceof Error ? err.message : err}`);
+					emit({
+						command: "activeTraceResult",
+						requestId,
+						status: "terminal",
+						signal: instancePath,
+						drivers: [],
+						message: `active trace failed: ${err instanceof Error ? err.message : err}`,
+					});
+				});
 				break;
 			}
 			case "removeVariable": {
