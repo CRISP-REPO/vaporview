@@ -814,7 +814,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     const document = this.lastActiveDocument;
     const metadata = await document.findTreeItem(signalName, undefined, undefined);
     if (metadata !== null) {
-      this.netlistExplorerPanel.reveal(metadata.netlistId);
+      this.netlistExplorerPanel.reveal(metadata);
     }
   }
 
@@ -833,7 +833,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
     if (netlistId === null || netlistId === undefined) {return;}
     const netlistItem = document.netlistIdTable[netlistId];
     if (netlistItem) {
-      this.netlistExplorerPanel.reveal(netlistId);
+      this.netlistExplorerPanel.reveal(netlistItem);
     }
   }
 
@@ -956,7 +956,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
         break;
       } 
       case 'reveal': {
-        this.netlistExplorerPanel.reveal(metadata.netlistId);
+        this.netlistExplorerPanel.reveal(metadata);
         break;
       }
       case "addLink": {
@@ -1132,7 +1132,7 @@ export class WaveformViewerProvider implements vscode.CustomEditorProvider<Vapor
 
     // If it's a scope item, we just reveal it in the netlist explorer
     if (metadata.contextValue === 'netlistScope') {
-      this.netlistExplorerPanel.reveal(metadata.netlistId);
+      this.netlistExplorerPanel.reveal(metadata);
       return;
     }
 

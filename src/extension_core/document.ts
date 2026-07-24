@@ -327,8 +327,15 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     return metadata;
   }
 
-  public async parseNetlistVariableSettings(signalInfo: SignalInfo, useNetlistId: boolean): Promise<ParsedSignalData> {
+  public async parseNetlistVariableSettings(signalInfo: SignalInfo, useNetlistId: boolean): Promise<ParsedSignalData | null> {
     const metadata = await this.getNetlistItemFromSignalInfo(signalInfo, useNetlistId);
+    // crisp_change (netlistId-collision fix): a saved row whose name resolves to
+    // a SCOPE is not a signal — it is a relic of the id-collision bug (a scope
+    // rendered as a variable row, then persisted in the viewer state). Drop it
+    // instead of resurrecting a bogus '.<scope>' row on every restore.
+    if (metadata !== null && metadata.contextValue === 'netlistScope') {
+      return null;
+    }
     if (metadata !== null) {
       const signalData = Object.assign(signalInfo, {
         netlistId:  metadata.netlistId,
@@ -731,7 +738,16 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     const sortedChildren = this.sortNetlistScopeChildren(children);
     if (element !== undefined) { element.children = sortedChildren; }
     children.forEach((child) => {
-      this._netlistIdTable[child.netlistId] = child;
+      // crisp_change (netlistId-collision fix): scope ids and variable ids come
+      // from DIFFERENT index spaces (wellen ScopeRef vs VarRef), so a scope and
+      // a variable can share a netlistId (e.g. top scope id 1 vs its var id 1).
+      // Every netlistIdTable consumer (renderSignals, webview context commands,
+      // WCP, save/restore) expects a VARIABLE — a scope stored here clobbers the
+      // variable's slot and an addVariable('top.sig') then renders the SCOPE as
+      // a phantom '.top' row instead of the signal.
+      if (child.contextValue !== 'netlistScope') {
+        this._netlistIdTable[child.netlistId] = child;
+      }
     });
     return sortedChildren;
   }

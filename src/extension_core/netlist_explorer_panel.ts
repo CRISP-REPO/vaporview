@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 
 import type { VaporviewDocument } from './document';
+import type { NetlistItem } from './tree_view';
 
 // Editor-pane Netlist Explorer.
 //
@@ -92,12 +93,16 @@ export class NetlistExplorerPanel {
     }
   }
 
-  /** Reveal (expand ancestors + scroll to) a signal by netlistId. */
-  reveal(netlistId: number | undefined | null) {
-    if (netlistId === undefined || netlistId === null) { return; }
-    this.createOrShow();
-    const item = this.activeDocument?.netlistIdTable[netlistId];
+  /**
+   * Reveal (expand ancestors + scroll to) a netlist item.
+   * crisp_change (netlistId-collision fix): takes the resolved NetlistItem, not a
+   * netlistId — scope ids and variable ids come from different index spaces, so a
+   * netlistIdTable lookup here could land on the wrong item (or miss entirely for
+   * scopes, which are no longer stored in the table).
+   */
+  reveal(item: NetlistItem | undefined | null) {
     if (!item) { return; }
+    this.createOrShow();
     this.panel?.webview.postMessage({ command: 'revealPath', instancePath: item.instancePath() });
   }
 
