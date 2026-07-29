@@ -32,7 +32,16 @@ import { Uri } from "./vscodeShims";
 import { WasmFormatHandler } from "../extension_core/wasm_handler";
 import { FsdbFormatHandler } from "../extension_core/fsdb_handler";
 import { VaporviewDocument } from "../extension_core/document";
-import { activeTraceStep, makeRtlScanCache, toHexIfBinary, type RtlScanCache, type TraceBackend } from "@crisp/core/trace";
+import {
+	activeTraceWalk,
+	makeActiveTraceWalkState,
+	makeRtlScanCache,
+	toHexIfBinary,
+	type ActiveTraceHop,
+	type ActiveTraceWalkState,
+	type RtlScanCache,
+	type TraceBackend,
+} from "@crisp/core/trace";
 
 /** Default signal colour palette (the webview falls back to these when no VSCode theme is available). */
 const DEFAULT_COLOR_PALETTE = [
@@ -222,10 +231,30 @@ async function main() {
 		return out;
 	};
 
-	// Active-trace RTL scan cache: reused across hops (bounded staleness — an RTL
-	// edit is picked up on the next rebuild after the TTL lapses).
+	// Active-trace RTL scan cache: reused across hops and walks (bounded
+	// staleness — an RTL edit is picked up on the next rebuild after the TTL).
 	const RTL_CACHE_TTL_MS = 30_000;
 	let rtlCacheEntry: { cwd: string; builtAt: number; cache: RtlScanCache } | undefined;
+	const rtlCacheFor = (cwd: string): RtlScanCache => {
+		const now = Date.now();
+		if (!rtlCacheEntry || rtlCacheEntry.cwd !== cwd || now - rtlCacheEntry.builtAt > RTL_CACHE_TTL_MS) {
+			rtlCacheEntry = { cwd, builtAt: now, cache: makeRtlScanCache() };
+		}
+		return rtlCacheEntry.cache;
+	};
+
+	// Active-trace walks: id → accumulated chain + walk state (visited set +
+	// hop budget + the shared RTL cache). A walk survives across pause/resume
+	// (decision points) until it reports done; capped to the most recent 20.
+	interface HostWalk {
+		state: ActiveTraceWalkState;
+		chain: ActiveTraceHop[];
+		time: number;
+		cwd: string;
+		done: boolean;
+	}
+	const walks = new Map<string, HostWalk>();
+	let walkCounter = 0;
 
 	// The tracer's waveform primitives, backed by the OPEN document — the same
 	// value reads and netlist search the viewer itself uses.
@@ -394,33 +423,76 @@ async function main() {
 				);
 				break;
 			}
-			// One interactive value-trace hop (desktop "Active trace" menu): find
-			// the RTL driver(s) of the signal at `time`, probe their values in the
-			// open waveform, and report either the unique active driver or the
-			// full candidate list. Pure code — no agent involved. The RTL scan
-			// cache (tree walk + file contents) is shared across hops for 30s so a
-			// click-chain re-walks the source tree at most every 30s, not per hop.
-			case "activeTrace": {
+			// Active Trace walk (desktop right-click — extension-parity, no agent):
+			// auto-follow the value-matching driver hop by hop; pause at genuine
+			// decision points; the desktop's Trace pane renders the chain and
+			// resumes/stops via activeTraceContinue/activeTraceStop. Replies carry
+			// the FULL accumulated chain so rendering is idempotent.
+			case "activeTrace":
+			case "activeTraceContinue":
+			case "activeTraceStop": {
 				const requestId = e.requestId;
-				const instancePath = String(e.instancePath ?? "");
-				const time = Number(e.time) || 0;
-				const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+				const isStop = e.command === "activeTraceStop";
+				const isContinue = e.command === "activeTraceContinue";
 				(async () => {
-					const now = Date.now();
-					if (!rtlCacheEntry || rtlCacheEntry.cwd !== cwd || now - rtlCacheEntry.builtAt > RTL_CACHE_TTL_MS) {
-						rtlCacheEntry = { cwd, builtAt: now, cache: makeRtlScanCache() };
+					let walkId = typeof e.walkId === "string" ? (e.walkId as string) : "";
+					let walk = walks.get(walkId);
+					const reply = (w: HostWalk, extra: Record<string, unknown>) =>
+						emit({
+							command: "activeTraceResult",
+							requestId,
+							walkId,
+							time: w.time,
+							hops: w.chain,
+							done: w.done,
+							...extra,
+						});
+
+					if (isStop) {
+						if (walk && !walk.done) {
+							walk.done = true;
+							reply(walk, { stopNote: "stopped by user" });
+						}
+						return;
 					}
-					const result = await activeTraceStep(traceBackend, { start: instancePath, time, cwd, cache: rtlCacheEntry.cache });
-					emit({ command: "activeTraceResult", requestId, ...result });
+
+					if (isContinue) {
+						if (!walk || walk.done) {
+							logErr(`standalone-host: activeTraceContinue for unknown/finished walk ${walkId}`);
+							return;
+						}
+					} else {
+						// New walk.
+						const time = Number(e.time) || 0;
+						const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+						walkId = `w${++walkCounter}`;
+						walk = { state: makeActiveTraceWalkState(rtlCacheFor(cwd)), chain: [], time, cwd, done: false };
+						walks.set(walkId, walk);
+						if (walks.size > 20) {
+							const oldest = walks.keys().next().value;
+							if (oldest) walks.delete(oldest);
+						}
+					}
+
+					const from = String(e.instancePath ?? "");
+					const seg = await activeTraceWalk(traceBackend, walk.state, {
+						from,
+						time: walk.time,
+						cwd: walk.cwd,
+						firstReason: isContinue ? "picked" : "start",
+					});
+					walk.chain.push(...seg.hops);
+					walk.done = seg.done;
+					reply(walk, { pending: seg.pending, stopNote: seg.stopNote });
 				})().catch((err) => {
-					logErr(`standalone-host: activeTrace(${instancePath}) failed: ${err instanceof Error ? err.message : err}`);
+					logErr(`standalone-host: ${e.command} failed: ${err instanceof Error ? err.message : err}`);
 					emit({
 						command: "activeTraceResult",
 						requestId,
-						status: "terminal",
-						signal: instancePath,
-						drivers: [],
-						message: `active trace failed: ${err instanceof Error ? err.message : err}`,
+						walkId: typeof e.walkId === "string" ? e.walkId : "",
+						hops: [],
+						done: true,
+						stopNote: `active trace failed: ${err instanceof Error ? err.message : err}`,
 					});
 				});
 				break;
