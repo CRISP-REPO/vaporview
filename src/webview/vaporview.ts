@@ -199,6 +199,9 @@ export function createWebviewContext(): WebviewStateEvent {
     zoomRatio: vaporview.viewport.zoomRatio,
     defaultPixelTime: viewport.defaultPixelTime * 100,
     scrollLeft: Math.round(vaporview.viewport.timeScrollLeft),
+    // Right edge of the visible time range: lets the host drive windowed
+    // waveform loading (large FSDBs) from ordinary context updates.
+    scrollRight: Math.round(vaporview.viewport.timeScrollRight),
     autoReload: viewerState.autoReload,
     displayedSignals: signalList,
   };

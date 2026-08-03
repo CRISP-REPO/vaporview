@@ -14,7 +14,7 @@ export type FsdbWorkerCommand =
   | { command: 'readMetadata' }
   | { command: 'readVars'; scopePath: string; scopeOffsetIdx: number }
   | { command: 'loadSignals'; signalIdList: number[] }
-  | { command: 'getValueChanges'; signalId: number }
+  | { command: 'getValueChanges'; signalId: number; maxTransitions?: number }
   | { command: 'getValuesAtTime'; signalId: number; time: number }
   | { command: 'unloadSignal'; signalId: number }
   | { command: 'setViewWindow'; startTime: number; endTime: number }

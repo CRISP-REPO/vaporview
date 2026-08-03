@@ -821,6 +821,16 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     return result;
   }
 
+  /// Visible time range from a context update — drives windowed waveform
+  /// loading for handlers that support it (FSDB). Fire-and-forget.
+  public updateRenderViewport(startTime: number, endTime: number): void {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const handler = this._handler as any;
+    if (typeof handler.updateRenderViewport === 'function') {
+      handler.updateRenderViewport(startTime, endTime);
+    }
+  }
+
   public async setViewWindow(startTime: number, endTime: number): Promise<void> {
     if ((this._handler as any).setViewWindow) {
       await (this._handler as any).setViewWindow(startTime, endTime);

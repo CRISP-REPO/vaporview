@@ -153,6 +153,7 @@ export type WebviewStateEvent = {
   displayedSignals?: SavedRowItem[];
   zoomRatio?: number;
   scrollLeft?: number;
+  scrollRight?: number;
   autoReload?: boolean;
   transitionCount?: number | null;
   selectedSignalCount?: number;

@@ -627,6 +627,16 @@ void loadSignals(const Napi::CallbackInfo &info) {
   fsdb_obj->ffrResetSignalList();
 }
 
+// getValueChanges(signalId [, maxTransitions])
+// With maxTransitions > 0 the traversal DECIMATES: value changes are
+// time-bucketed (bucket = span / maxTransitions) and only the first change
+// of each bucket is extracted — plus the final change, so the settled value
+// after the last activity is always exact. Skipped changes cost only the
+// traverse step (no string extraction), which is where the CPU goes on a
+// dense signal. Rendering stays honest at the zoom level that requested the
+// cap (sub-pixel detail collapses), and zooming in reloads under a narrower
+// window where the same cap yields finer buckets — exact once the window's
+// change count fits the cap. min/max reflect extracted changes only.
 Napi::Object getValueChanges(const Napi::CallbackInfo &info) {
   Napi::Env env = info.Env();
 
@@ -634,7 +644,11 @@ Napi::Object getValueChanges(const Napi::CallbackInfo &info) {
   Napi::Array valueChanges = Napi::Array::New(env);
   result.Set("valueChanges", valueChanges);
 
-  if (!CHECK_LENGTH(env, info, 1)) return result;
+  if (info.Length() < 1) {
+    Napi::TypeError::New(env, "Incorrect number of arguments")
+        .ThrowAsJavaScriptException();
+    return result;
+  }
   if (!CHECK_NUMBER(env, info[0])) return result;
 
 #ifdef FSDB_USE_32B_IDCODE
@@ -642,6 +656,11 @@ Napi::Object getValueChanges(const Napi::CallbackInfo &info) {
 #else
   fsdbVarIdcode var_idcode = info[0].As<Napi::Number>().Int64Value();
 #endif
+
+  int64_t max_transitions = 0;
+  if (info.Length() >= 2 && info[1].IsNumber()) {
+    max_transitions = info[1].As<Napi::Number>().Int64Value();
+  }
 
   double _min = 0.0;
   double _max = 0.0;
@@ -655,16 +674,63 @@ Napi::Object getValueChanges(const Napi::CallbackInfo &info) {
     return result;
   }
 
-  // Jump to the minimum time(xtag).
+  // Jump to the minimum time(xtag) FIRST — tag queries on an unpositioned
+  // traverse handle are not trustworthy on every reader build.
   vc_trvs_hdl->ffrGetMinXTag((void *)&time);
   vc_trvs_hdl->ffrGotoXTag((void *)&time);
+
+  // Bucket width for decimation, from this signal's in-core time span.
+  double bucket = 0.0;
+  uint64_t t_min = 0;
+  if (max_transitions > 0) {
+    fsdbTag64 min_tag, max_tag;
+    vc_trvs_hdl->ffrGetMinXTag((void *)&min_tag);
+    vc_trvs_hdl->ffrGetMaxXTag((void *)&max_tag);
+    t_min = combineTime(min_tag.H, min_tag.L);
+    const uint64_t t_max = combineTime(max_tag.H, max_tag.L);
+    if (t_max > t_min) {
+      bucket = (double)(t_max - t_min) / (double)max_transitions;
+      if (bucket < 1.0) bucket = 0.0;  // span already finer than the cap
+    }
+  }
+  bool decimated = false;
+  uint64_t last_emitted_time = 0;
+  double next_emit_time = 0.0;  // emit whenever vc_time >= this
   do {  // TODO(heyfey): fix glitch & delta
     byte_T *vc_ptr;
     vc_trvs_hdl->ffrGetXTag(&time);
+    if (bucket > 0.0) {
+      const uint64_t vc_time = combineTime(time.H, time.L);
+      if ((double)vc_time < next_emit_time) {
+        decimated = true;
+        continue;  // skipped: no value extraction, traverse cost only
+      }
+      const double idx = ((double)(vc_time - t_min)) / bucket;
+      next_emit_time = (double)t_min + ((uint64_t)idx + 1) * bucket;
+      last_emitted_time = vc_time;
+    }
     vc_trvs_hdl->ffrGetVC(&vc_ptr);
     __PrintTimeValChng(vc_trvs_hdl, &time, vc_ptr, info, valueChanges, _min,
                        _max);
   } while (FSDB_RC_SUCCESS == vc_trvs_hdl->ffrGotoNextVC());
+
+  // Decimation drops interior changes of a bucket, so the LAST change of the
+  // signal may have been skipped — without it the settled value after the
+  // final burst would be a stale first-of-bucket value. Re-fetch it exactly.
+  if (decimated) {
+    fsdbTag64 max_tag;
+    vc_trvs_hdl->ffrGetMaxXTag((void *)&max_tag);
+    const uint64_t t_last = combineTime(max_tag.H, max_tag.L);
+    if (t_last > last_emitted_time
+        && FSDB_RC_SUCCESS == vc_trvs_hdl->ffrGotoXTag((void *)&max_tag)) {
+      byte_T *vc_ptr;
+      vc_trvs_hdl->ffrGetXTag(&max_tag);
+      vc_trvs_hdl->ffrGetVC(&vc_ptr);
+      __PrintTimeValChng(vc_trvs_hdl, &max_tag, vc_ptr, info, valueChanges,
+                         _min, _max);
+    }
+  }
+  result.Set("decimated", Napi::Boolean::New(env, decimated));
 
   Napi::Number min = Napi::Number::New(env, _min);
   result.Set("min", min);

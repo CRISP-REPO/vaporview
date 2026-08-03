@@ -522,6 +522,15 @@ async function main() {
 				const ctx: Record<string, unknown> = { ...e };
 				delete ctx.command;
 				lastContext = ctx;
+				// Visible time range → windowed waveform loading (large FSDBs).
+				// The webview already rate-limits context updates; the handler
+				// additionally skips when the loaded window still covers this.
+				const sl = Number(ctx.scrollLeft);
+				const sr = Number(ctx.scrollRight);
+				if (isFinite(sl) && isFinite(sr) && sr > sl) {
+					// eslint-disable-next-line @typescript-eslint/no-explicit-any
+					(document as any).updateRenderViewport(sl, sr);
+				}
 				if (saveTimer) {
 					clearTimeout(saveTimer);
 				}

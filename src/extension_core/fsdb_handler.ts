@@ -116,6 +116,95 @@ export class FsdbFormatHandler implements WaveformFileParser {
   private parametersLoaded: boolean = false;
 
   public postMessageToWebview = (_message: Record<string, unknown>) => {};
+
+  /// Windowed / transient loading (the 2 GB FSDB story). Every consumer of
+  /// in-core value changes calls loadSignals before reading, so nothing needs
+  /// the worker to KEEP signals loaded between operations. Each operation is
+  /// therefore self-contained — (set view window) → load → read → unload —
+  /// and the worker's resident memory stays at file-index size instead of
+  /// accumulating every signal ever displayed or annotated.
+  /// CRISP_FSDB_EAGER=1 restores the old keep-everything behavior in case a
+  /// site's FSDB reader mishandles ffrSetViewWindow (values reading as x).
+  private static readonly kEagerMode = process.env.CRISP_FSDB_EAGER === '1';
+  /// One webview message per this many transitions: a high-toggle signal in a
+  /// large dump serializes in bounded slices instead of one giant message
+  /// that stalls the host and the webview (assembly flattens the chunks).
+  private static readonly kTransitionsPerChunk = 100_000;
+  /// The FSDB reader has ONE global view window, so window+load+read+unload
+  /// sequences from different callers (viewer annotations, Active Trace,
+  /// signal adds) must not interleave — same promise-chain pattern as the
+  /// standalone host's serialized().
+  private opChain: Promise<unknown> = Promise.resolve();
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.opChain.then(fn, fn);
+    this.opChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private async unloadWorkerSignals(signalIdList: number[]): Promise<void> {
+    if (FsdbFormatHandler.kEagerMode) { return; }
+    for (const signalId of signalIdList) {
+      await this.callFsdbWorkerTask({ command: 'unloadSignal', signalId: signalId });
+    }
+  }
+
+  /// Viewport-driven windowed RENDER data. For dumps above the size
+  /// threshold, displayed signals carry value changes only for the current
+  /// viewport (padded by one span each side). When the user pans/zooms past
+  /// the loaded window, the webview is asked to re-request every displayed
+  /// variable and the reload happens under the new window. Regions outside
+  /// the loaded window render as x (the handler appends an x sentinel at the
+  /// window end; the renderer x-fills before the first transition), so the
+  /// viewer shows "unknown", never a wrong flat line.
+  private static readonly kWindowThresholdBytes =
+    Number(process.env.CRISP_FSDB_WINDOW_MB ?? 256) * 1024 * 1024;
+  private static readonly kWindowLog = process.env.CRISP_FSDB_WINDOW_LOG === '1';
+  private windowedRenderEnabled = false;
+  private renderWindow: { start: number; end: number } | null = null;
+  /// The webview emits context updates DURING initialization — default zoom,
+  /// pre-restore scroll — whose visible range is a meaningless sliver of the
+  /// dump. Trusting one of those poisons the render window and every signal
+  /// restored during init loads a sliver of data ("waveform positions off").
+  /// Windowing therefore stays inert until one settled full-dump view has
+  /// been seen (the open sequence always fits the whole dump once).
+  private seenSettledView = false;
+
+  /// Called (debounced by the webview's own contextUpdate cadence) with the
+  /// visible time range. Decides whether the loaded window still covers it.
+  public updateRenderViewport(startTime: number, endTime: number): void {
+    if (!this.windowedRenderEnabled || FsdbFormatHandler.kEagerMode) { return; }
+    const timeEnd = this.metadata.timeEnd;
+    if (!(timeEnd > 0) || !isFinite(startTime) || !isFinite(endTime) || endTime <= startTime) { return; }
+    const span = endTime - startTime;
+    const start = Math.max(0, Math.floor(startTime - span));
+    const end = Math.min(timeEnd, Math.ceil(endTime + span));
+    // Zoomed out (padded window ≈ whole dump): plain full-range loading.
+    const wantsFull = start <= 0 && end >= timeEnd;
+    if (FsdbFormatHandler.kWindowLog) {
+      console.error(`[fsdb-window] viewport=[${startTime}, ${endTime}] timeEnd=${timeEnd} `
+        + `padded=[${start}, ${end}] wantsFull=${wantsFull} settled=${this.seenSettledView} `
+        + `window=${this.renderWindow ? `[${this.renderWindow.start}, ${this.renderWindow.end}]` : 'full'}`);
+    }
+    if (wantsFull) {
+      this.seenSettledView = true;
+      if (this.renderWindow !== null) {
+        this.renderWindow = null;
+        this.postMessageToWebview({ command: 'refetch-signals' });
+      }
+      return;
+    }
+    if (!this.seenSettledView) {
+      return; // init churn — never window before the first settled fit
+    }
+    // Still covered (with the padding as slack) — nothing to do.
+    if (this.renderWindow
+        && this.renderWindow.start <= Math.max(0, startTime - span * 0.25)
+        && this.renderWindow.end >= Math.min(timeEnd, endTime + span * 0.25)) {
+      return;
+    }
+    this.renderWindow = { start: start, end: end };
+    this.postMessageToWebview({ command: 'refetch-signals' });
+  }
   public metadata: WaveformDumpMetadata = {
     timeTableLoaded: false,
     scopeCount: 0,
@@ -136,6 +225,13 @@ export class FsdbFormatHandler implements WaveformFileParser {
     this.providerDelegate = providerDelegate;
     this.uri = uri;
     this.findTreeItemFn = findTreeItemFn;
+    try {
+      // Windowed render data only pays for big dumps — small ones load whole.
+      this.windowedRenderEnabled =
+        fs.statSync(uri.fsPath).size > FsdbFormatHandler.kWindowThresholdBytes;
+    } catch {
+      this.windowedRenderEnabled = false;
+    }
   }
 
   // #region SSH Remote Methods
@@ -1179,44 +1275,104 @@ export class FsdbFormatHandler implements WaveformFileParser {
   }
 
   async getSignalData(signalIdList: SignalId[]): Promise<void> {
-    await vscode.window.withProgress({
-      location: vscode.ProgressLocation.Notification,
-      title: "Loading signals",
-      cancellable: false
-    }, async () => {
-      await this.callFsdbWorkerTask({
-        command: 'loadSignals',
-        signalIdList: signalIdList
-      });
-    });
+    // The webview's refetch path sends one entry per ROW; shared signals only
+    // need one load/ship.
+    signalIdList = Array.from(new Set(signalIdList));
+    return this.runExclusive(async () => {
+      // Snapshot: the render window can move while we are inside the chain.
+      const renderWin = FsdbFormatHandler.kEagerMode ? null : this.renderWindow;
+      if (renderWin) {
+        await this.setViewWindow(renderWin.start, renderWin.end);
+      }
+      try {
+        await vscode.window.withProgress({
+          location: vscode.ProgressLocation.Notification,
+          title: "Loading signals",
+          cancellable: false
+        }, async () => {
+          await this.callFsdbWorkerTask({
+            command: 'loadSignals',
+            signalIdList: signalIdList
+          });
+        });
+      } finally {
+        if (renderWin) {
+          // Restore immediately: only ffrLoadSignals consults the view
+          // window, and anything later in this chain (or a queued operation)
+          // must see the full range.
+          await this.setViewWindow(0, Math.max(this.metadata.timeEnd, renderWin.end));
+        }
+      }
 
-    // Map each signalId to a promise for handling its task
-    const tasks = signalIdList.map(async (signalId) => {
-      const result = await this.callFsdbWorkerTask({
-        command: 'getValueChanges',
-        signalId: signalId
-      });
-      const message = result;
-      const data = message.result as FsdbWaveformData;
-
-      this.postMessageToWebview({
-        command: 'update-waveform-chunk',
-        signalId: signalId,
-        transitionDataChunk: data.valueChanges,
-        totalChunks: 1,
-        chunkNum: 0,
-        min: data.min,
-        max: data.max
-      } as ValueChangeDataChunk);
+      // Sequential on purpose: ship one signal's history, then free it — the
+      // worker's peak is ONE signal's data rather than the whole list, and
+      // the webview starts rendering the first row sooner.
+      // Decimation cap for RENDER data — OPT-IN (CRISP_FSDB_MAX_TRANSITIONS=N)
+      // until verified against a real Verdi reader: the bucketing depends on
+      // ffrGetMin/MaxXTag semantics that cannot be tested without the FSDB
+      // libs. The trace/API path (getValueChangesForSignal) is never capped.
+      const maxTransitions = this.windowedRenderEnabled && !FsdbFormatHandler.kEagerMode
+        ? Number(process.env.CRISP_FSDB_MAX_TRANSITIONS ?? 0)
+        : 0;
+      for (const signalId of signalIdList) {
+        const result = await this.callFsdbWorkerTask({
+          command: 'getValueChanges',
+          signalId: signalId,
+          maxTransitions: maxTransitions > 0 ? maxTransitions : undefined
+        });
+        const data = result.result as FsdbWaveformData;
+        if (FsdbFormatHandler.kEagerMode) {
+          // Byte-identical legacy transfer: ONE message, no sentinel, no
+          // unload — CRISP_FSDB_EAGER=1 must reproduce the old behavior
+          // exactly so it can bisect regressions in the new path.
+          this.postMessageToWebview({
+            command: 'update-waveform-chunk',
+            signalId: signalId,
+            transitionDataChunk: data.valueChanges,
+            totalChunks: 1,
+            chunkNum: 0,
+            min: data.min,
+            max: data.max
+          } as ValueChangeDataChunk);
+          continue;
+        }
+        let changes = data.valueChanges ?? [];
+        // Windowed load: mark where the data ends. The renderer extends the
+        // last transition flat to the end of time — an x sentinel at the
+        // window edge renders the unloaded tail as "unknown" instead. (The
+        // region BEFORE the window x-fills already: the renderer unshifts
+        // [0, x…] whenever data does not start at 0.)
+        if (renderWin && changes.length > 0 && renderWin.end < this.metadata.timeEnd) {
+          const lastValue = String(changes[changes.length - 1][1] ?? 'x');
+          const sentinel: [number, string] = [renderWin.end, 'x'.repeat(Math.max(1, lastValue.length))];
+          changes = changes.concat([sentinel]);
+        }
+        const per = FsdbFormatHandler.kTransitionsPerChunk;
+        const totalChunks = Math.max(1, Math.ceil(changes.length / per));
+        for (let chunkNum = 0; chunkNum < totalChunks; chunkNum++) {
+          this.postMessageToWebview({
+            command: 'update-waveform-chunk',
+            signalId: signalId,
+            transitionDataChunk: changes.slice(chunkNum * per, (chunkNum + 1) * per),
+            totalChunks: totalChunks,
+            chunkNum: chunkNum,
+            min: data.min,
+            max: data.max
+          } as ValueChangeDataChunk);
+        }
+        // The webview owns its copy now — the in-core one is pure waste.
+        await this.unloadWorkerSignals([signalId]);
+      }
     });
-    // Run all tasks concurrently
-    await Promise.all(tasks);
   }
 
   async getValueChangesForSignal(signalId: SignalId): Promise<any> {
-    await this.callFsdbWorkerTask({ command: 'loadSignals', signalIdList: [signalId] });
-    const result = await this.callFsdbWorkerTask({ command: 'getValueChanges', signalId: signalId });
-    return (result.result as FsdbWaveformData);
+    return this.runExclusive(async () => {
+      await this.callFsdbWorkerTask({ command: 'loadSignals', signalIdList: [signalId] });
+      const result = await this.callFsdbWorkerTask({ command: 'getValueChanges', signalId: signalId });
+      await this.unloadWorkerSignals([signalId]);
+      return (result.result as FsdbWaveformData);
+    });
   }
 
   async getEnumData(enumList: EnumQueueEntry[]): Promise<void> {
@@ -1240,21 +1396,42 @@ export class FsdbFormatHandler implements WaveformFileParser {
     }
 
     const signalIdList = Array.from(signalId2values.keys());
-    await this.callFsdbWorkerTask({
-      command: 'loadSignals',
-      signalIdList: signalIdList
-    });
+    await this.runExclusive(async () => {
+      // Editor annotations ask for values of up to ~150 identifiers at ONE
+      // time point — loading full histories for that reads gigabytes from a
+      // big dump. Narrow the reader's view window to the queried instant
+      // (ffrLoadSignals then brings only the effective values in-core), and
+      // always restore the full-range window afterwards so a later signal
+      // add is not silently truncated.
+      const windowed = !FsdbFormatHandler.kEagerMode;
+      try {
+        if (windowed) {
+          // A hair of padding on both sides: tolerate exclusive-end reader
+          // semantics and fractional marker times.
+          await this.setViewWindow(Math.max(0, Math.floor(time) - 1), Math.ceil(time) + 1);
+        }
+        await this.callFsdbWorkerTask({
+          command: 'loadSignals',
+          signalIdList: signalIdList
+        });
 
-    // Call fsdbworker task for each signalId
-    await Promise.all(signalIdList.map(async (signalId) => {
-      const result = await this.callFsdbWorkerTask({
-        command: 'getValuesAtTime',
-        signalId: signalId,
-        time: time
-      });
-      const message = result;
-      signalId2values.set(signalId, (message.result as string | string[]) ?? '');
-    }));
+        // Call fsdbworker task for each signalId
+        await Promise.all(signalIdList.map(async (signalId) => {
+          const result = await this.callFsdbWorkerTask({
+            command: 'getValuesAtTime',
+            signalId: signalId,
+            time: time
+          });
+          const message = result;
+          signalId2values.set(signalId, (message.result as string | string[]) ?? '');
+        }));
+      } finally {
+        if (windowed) {
+          await this.setViewWindow(0, Math.max(this.metadata.timeEnd, Math.ceil(time) + 1));
+          await this.unloadWorkerSignals(signalIdList);
+        }
+      }
+    });
 
     // Convert the map to an array of objects
     const result = [];

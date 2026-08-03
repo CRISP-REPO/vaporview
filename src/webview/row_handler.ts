@@ -21,6 +21,28 @@ interface ApplyStateSettings {
 export class RowHandler {
 
   rowItems: RowItem[]         = []; // rowId is the key/index, RowItem is the value
+
+  // Host request (windowed FSDB loading): re-fetch value data for every
+  // displayed variable. One entry per row so every row's canvas redraws when
+  // its signal's chunks assemble; the handler dedupes signalIds so shared
+  // signals still load once.
+  refetchAllVariables() {
+    const entries: SignalQueueEntry[] = [];
+    this.rowItems.forEach((item, rowId) => {
+      if (!(item instanceof NetlistVariable)) {return;}
+      if (item.signalId === undefined) {return;}
+      entries.push({
+        type: 'signal',
+        signalWidth: item.signalWidth,
+        signalId: item.signalId,
+        rowId: rowId,
+      });
+    });
+    if (entries.length > 0) {
+      dataManager.requestData(entries, []);
+    }
+  }
+
   groupIdTable: RowId[]       = []; // group ID is the key/index, rowId is the value
   private nextRowId: number   = 0;
   private nextGroupId: number = 1;

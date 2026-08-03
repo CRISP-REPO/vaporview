@@ -18,7 +18,7 @@ interface FsdbAddon {
     readMetadata(setMetadataFn: (...args: Parameters<typeof setMetadata>) => void, setChunkSizeFn: (chunksize: number, timeend: number) => void): void;
     readVars(scopePath: string, scopeOffsetIdx: number, varCallback: (...args: Parameters<typeof fsdbVarCallback>) => void, arrayBeginCallback: (name: string, path: string, netlistId: number) => void, arrayEndCallback: (size: number) => void): void;
     loadSignals(signalIdList: number[]): void;
-    getValueChanges(signalId: number): FsdbWaveformData;
+    getValueChanges(signalId: number, maxTransitions?: number): FsdbWaveformData;
     getValuesAtTime(signalId: number, time: number): string | string[];
     unloadSignal(signalId: number): void;
     setViewWindow(startTime: number, endTime: number): void;
@@ -26,6 +26,7 @@ interface FsdbAddon {
     unload(): void;
 }
 
+let vcCapSupported: boolean | null = null;
 let fsdbAddon: FsdbAddon | null = null;
 try {
     // CRISP_FSDB_ADDON points at a prebuilt fsdb_reader.node (e.g. the Crisp
@@ -86,7 +87,24 @@ function handleMessage(message: FsdbWorkerIpcMessage): FsdbWaveformData | string
             break;
         }
         case 'loadSignals': { fsdbAddon.loadSignals(message.signalIdList); break; }
-        case 'getValueChanges': { return fsdbAddon.getValueChanges(message.signalId); }
+        case 'getValueChanges': {
+            const maxTransitions = message.maxTransitions ?? 0;
+            // Prebuilt addons from before the decimation change reject a 2nd
+            // argument ("Incorrect number of arguments") — detect once and
+            // fall back to the uncapped single-argument form.
+            if (maxTransitions > 0 && vcCapSupported !== false) {
+                try {
+                    const r = fsdbAddon.getValueChanges(message.signalId, maxTransitions);
+                    vcCapSupported = true;
+                    return r;
+                } catch (e) {
+                    if (vcCapSupported === true) { throw e; }
+                    vcCapSupported = false;
+                    console.error('FSDB worker: addon predates maxTransitions — loading uncapped');
+                }
+            }
+            return fsdbAddon.getValueChanges(message.signalId);
+        }
         case 'getValuesAtTime': { return fsdbAddon.getValuesAtTime(message.signalId, message.time); }
         case 'unloadSignal': { fsdbAddon.unloadSignal(message.signalId); break; }
         case 'setViewWindow': { fsdbAddon.setViewWindow(message.startTime, message.endTime); break; }

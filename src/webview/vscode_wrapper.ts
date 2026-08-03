@@ -479,6 +479,11 @@ export class VscodeWrapper {
       case 'remove-signal':         {rowHandler.removeVariable(message.netlistId, message.rowId ?? (message.netlistId === undefined ? viewerState.selectedSignal[0] : undefined), message.removeAllSelected); break;}
       case 'remove-group':          {rowHandler.removeSignalGroup(message.groupId, message.recursive); break;}
       case 'remove-separator':      {rowHandler.removeVariable(undefined, message.rowId, message.removeAllSelected); break;}
+      // Windowed loading (large FSDBs): the host's loaded time window no
+      // longer covers the viewport — re-request every displayed variable
+      // through the normal requestData path so chunk bookkeeping is set up
+      // exactly like a first load.
+      case 'refetch-signals':       {rowHandler.refetchAllVariables(); break;}
       case 'update-waveform-chunk': {dataManager.updateWaveformChunk(message); break;}
       case 'update-waveform-chunk-compressed': {dataManager.updateWaveformChunkCompressed(message); break;}
       case 'update-enum-chunk':     {dataManager.updateEnumChunk(message); break;}
