@@ -398,6 +398,55 @@ async function main() {
 			// which don't carry ids — resolved via findTreeItem). With select:true
 			// (active-trace hop) the signal is only added when not already shown,
 			// and the viewer selection is moved to it either way.
+			// Editor → waveform DnD: the code editor drags plain identifier
+			// names (it knows nothing of hierarchy). Resolve each against the
+			// netlist — exact LEAF match, shortest instance path wins (top-most
+			// scope) — and render what resolves. Always ack with the tally so
+			// the desktop can tell the user what a dropped name resolved to.
+			case "addSignalsByName": {
+				const names = Array.isArray(e.names) ? (e.names as unknown[]).slice(0, 8).map(String) : [];
+				(async () => {
+					const added: string[] = [];
+					const alreadyShown: string[] = [];
+					const unresolved: string[] = [];
+					for (const name of names) {
+						try {
+							const res = await document.searchNetlist(name, undefined);
+							// eslint-disable-next-line @typescript-eslint/no-explicit-any
+							const hits = (res.searchResults as any[]) ?? [];
+							let best: string | undefined;
+							for (const h of hits) {
+								const p = String(h.instancePath ?? "");
+								if ((p.split(".").pop() ?? "") !== name) continue;
+								if (!best || p.length < best.length) best = p;
+							}
+							if (!best) {
+								unresolved.push(name);
+								continue;
+							}
+							if (displayedInstancePaths().has(best)) {
+								alreadyShown.push(best);
+								continue;
+							}
+							const item = await document.findTreeItem(best, undefined, undefined);
+							// eslint-disable-next-line @typescript-eslint/no-explicit-any
+							const netlistId = (item as any)?.netlistId;
+							if (typeof netlistId !== "number") {
+								unresolved.push(name);
+								continue;
+							}
+							await document.renderSignals([netlistId], undefined, undefined);
+							added.push(best);
+						} catch {
+							unresolved.push(name);
+						}
+					}
+					emit({ command: "signalsAddedByName", added, alreadyShown, unresolved });
+				})().catch((err) =>
+					logErr(`standalone-host: addSignalsByName failed: ${err instanceof Error ? err.message : err}`),
+				);
+				break;
+			}
 			case "addVariable": {
 				(async () => {
 					let netlistId = typeof e.netlistId === "number" ? (e.netlistId as number) : undefined;
