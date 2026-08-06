@@ -37,6 +37,12 @@ world filehandler {
   export getsignaldata: func(signalidlist: list<u32>);
   export getenumdata: func(netlistidlist: list<u32>);
   export getvaluesattime: func(time: u64, paths: string) -> string;
+  // crisp_change: full transition history for ONE signal (JSON [[time,"value"],…]),
+  // windowed by [starttime, endtime] (endtime 0 = to the end) and capped at
+  // maxchanges (0 = uncapped). Powers exact first-X scans, sequential-x
+  // classification and clock-edge extraction for VCD/FST — formats whose
+  // handler previously had no host-side history at all.
+  export getvaluechanges: func(signalid: u32, starttime: u64, endtime: u64, maxchanges: u32) -> string;
   export searchnetlist: func(searchquery: string, scopeid: u32) -> string;
 
   export loadremotestatus: func(status: list<u8>) -> string;

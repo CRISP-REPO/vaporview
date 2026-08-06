@@ -22,7 +22,7 @@
  * dist/standalone-host.js (CJS, Node).
  */
 import { createInterface } from "readline";
-import { readFile } from "fs/promises";
+import { readFile, readdir } from "fs/promises";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { createHash } from "crypto";
 import * as os from "os";
@@ -34,9 +34,13 @@ import { FsdbFormatHandler } from "../extension_core/fsdb_handler";
 import { VaporviewDocument } from "../extension_core/document";
 import {
 	activeTraceWalk,
+	findAssignments,
+	hasUnknownBits,
 	makeActiveTraceWalkState,
 	makeRtlScanCache,
+	normalizeInstancePath,
 	toHexIfBinary,
+	traceSignal,
 	type ActiveTraceHop,
 	type ActiveTraceWalkState,
 	type RtlScanCache,
@@ -256,6 +260,27 @@ async function main() {
 	const walks = new Map<string, HostWalk>();
 	let walkCounter = 0;
 
+	// Reduce a viewer value to a settled scalar string. The wasm backend hands
+	// back glitch/edge arrays — sometimes REAL arrays, sometimes STRINGIFIED
+	// (`["0","1"]`), sometimes malformed (`[],"0"]`) — and every host-side
+	// consumer (edge detection, assertion eval, run diff) needs the settled
+	// value, exactly like the core tracer's own scalarOf.
+	const scalarize = (raw: unknown): string => {
+		if (Array.isArray(raw)) return raw.length ? String(raw[raw.length - 1]) : "";
+		const s = String(raw ?? "");
+		if (s.length > 1 && s.startsWith("[") && s.endsWith("]")) {
+			try {
+				const arr = JSON.parse(s);
+				if (Array.isArray(arr) && arr.length) return String(arr[arr.length - 1]);
+			} catch {
+				/* not JSON — try the last quoted token below */
+			}
+			const m = /"([^"]*)"\s*\]$/.exec(s);
+			if (m) return m[1]!;
+		}
+		return s;
+	};
+
 	// The tracer's waveform primitives, backed by the OPEN document — the same
 	// value reads and netlist search the viewer itself uses.
 	const traceBackend: TraceBackend = {
@@ -265,7 +290,7 @@ async function main() {
 			const values = await (document as any).getValuesAtTime({ time, instancePaths: paths });
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
 			return (values as any[]).map((v) => {
-				const scalar = Array.isArray(v.value) ? v.value[v.value.length - 1] : v.value;
+				const scalar = scalarize(v.value);
 				return { instancePath: String(v.instancePath), value: scalar, valueHex: toHexIfBinary(scalar) };
 			});
 		},
@@ -277,6 +302,408 @@ async function main() {
 				.map((h) => String(h.instancePath ?? ""))
 				.filter(Boolean);
 		},
+		// Exact transition history (FSDB only — the wasm handler has no
+		// value-change read, so VCD/FST return null and the tracer degrades to
+		// its structural answer, exactly as documented on the interface).
+		async valueChanges(path, opts) {
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const res = await (document as any).getValueChangesForPath(path);
+			const vc = res?.valueChanges;
+			if (!Array.isArray(vc)) return null;
+			let out = vc as Array<[number, string]>;
+			if (opts?.start !== undefined) out = out.filter(([t]) => t >= (opts.start as number));
+			if (opts?.end !== undefined) out = out.filter(([t]) => t <= (opts.end as number));
+			return out;
+		},
+	};
+
+	// ---- SVA assertion checking (native subset) -------------------------------
+	// Supported form: [label:] assert property (@(posedge|negedge clk)
+	// [disable iff (expr)] A |-> B) — plus |=> and consequent-only properties.
+	// Boolean expressions over dump signals with ! ~ && || & | ^ == != parens,
+	// literals, and $rose/$fell/$stable/$past. Sequence syntax (##, [*…],
+	// throughout, …) is reported as unsupported rather than mis-evaluated.
+	interface SvaAssertion {
+		label: string;
+		file: string;
+		line: number;
+		edge: string;
+		clk: string;
+		disable?: string;
+		ante: string;
+		conseq: string;
+		op: string;
+		text: string;
+		unsupported?: boolean;
+	}
+
+	const kRtlSkipDirs = new Set([
+		"node_modules", ".git", "build", "build-docker", "dist", "out", "obj", "target",
+	]);
+	const listRtlFiles = async (root: string, cap = 1500): Promise<string[]> => {
+		const out: string[] = [];
+		const walkDir = async (dir: string): Promise<void> => {
+			if (out.length >= cap) return;
+			let entries;
+			try {
+				entries = await readdir(dir, { withFileTypes: true });
+			} catch {
+				return;
+			}
+			for (const ent of entries) {
+				if (out.length >= cap) return;
+				if (ent.isDirectory()) {
+					if (kRtlSkipDirs.has(ent.name) || ent.name.startsWith(".")) continue;
+					await walkDir(nodePath.join(dir, ent.name));
+				} else if (/\.(sv|v|svh)$/i.test(ent.name)) {
+					out.push(nodePath.join(dir, ent.name));
+				}
+			}
+		};
+		await walkDir(root);
+		return out;
+	};
+
+	const parseAssertions = (content: string, file: string): SvaAssertion[] => {
+		const out: SvaAssertion[] = [];
+		const re = /(?:(\w+)\s*:\s*)?assert\s+property\s*\(/g;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(content))) {
+			const start = re.lastIndex;
+			let depth = 1;
+			let i = start;
+			for (; i < content.length && depth > 0; i++) {
+				const c = content[i];
+				if (c === "(") depth++;
+				else if (c === ")") depth--;
+			}
+			if (depth !== 0) break;
+			const body = content.slice(start, i - 1);
+			const line = content.slice(0, m.index).split("\n").length;
+			re.lastIndex = i;
+			const ck = /@\(\s*(posedge|negedge)\s+([\w.]+)\s*\)/.exec(body);
+			if (!ck) continue;
+			let rest = body.replace(ck[0], " ");
+			let disable: string | undefined;
+			const dis = /disable\s+iff\s*\(([^)]*)\)/.exec(rest);
+			if (dis) {
+				disable = dis[1];
+				rest = rest.replace(dis[0], " ");
+			}
+			// Split at a top-level |-> or |=> (never inside parens).
+			let op = "";
+			let opIdx = -1;
+			let d = 0;
+			for (let j = 0; j < rest.length - 2; j++) {
+				const c = rest[j];
+				if (c === "(") d++;
+				else if (c === ")") d--;
+				else if (d === 0 && c === "|" && (rest[j + 1] === "-" || rest[j + 1] === "=") && rest[j + 2] === ">") {
+					op = rest.slice(j, j + 3);
+					opIdx = j;
+					break;
+				}
+			}
+			const ante = opIdx >= 0 ? rest.slice(0, opIdx).trim() : "1'b1";
+			const conseq = (opIdx >= 0 ? rest.slice(opIdx + 3) : rest).trim();
+			const unsupported =
+				/##|\[\*|\[->|\[=|\bthroughout\b|\bwithin\b|\bfirst_match\b|\bs_?eventually\b|\buntil\b|\bintersect\b/.test(
+					rest,
+				);
+			out.push({
+				label: m[1] ?? "",
+				file,
+				line,
+				edge: ck[1]!,
+				clk: ck[2]!,
+				disable,
+				ante,
+				conseq,
+				op: op || "|->",
+				text: body.trim().replace(/\s+/g, " ").slice(0, 160),
+				unsupported,
+			});
+		}
+		return out;
+	};
+
+	// Tiny boolean evaluator. Values are scalar strings (hex-normalized where
+	// possible); x/z propagates as null (three-valued: a failure requires a
+	// DEFINITE false). Multibit & | ^ are evaluated on truthiness — good enough
+	// for the control assertions this targets.
+	type SvaEnv = { cur: Map<string, string>; prev: Map<string, string> | null };
+	const svaNorm = (s: string | undefined): string | null => {
+		if (s === undefined || s === "") return null;
+		if (hasUnknownBits(s)) return null;
+		// toHexIfBinary yields "0x…" — drop the prefix BEFORE the leading-zero
+		// strip, or "0x1" becomes the never-numeric "x1".
+		let t = (toHexIfBinary(s) ?? s).toLowerCase();
+		if (t.startsWith("0x")) t = t.slice(2);
+		return t.replace(/^0+(?=.)/, "");
+	};
+	const svaTruthy = (s: string | null): boolean | null => {
+		if (s === null) return null;
+		if (/^[0-9a-f]+$/.test(s)) {
+			try {
+				return BigInt("0x" + s) !== 0n;
+			} catch {
+				return null;
+			}
+		}
+		return s.length > 0;
+	};
+	const svaLiteral = (tok: string): string | null => {
+		const sized = /^\d*'s?([bodh])([0-9a-fx_z?]+)$/i.exec(tok);
+		if (sized) {
+			const base = sized[1]!.toLowerCase();
+			const digits = sized[2]!.replace(/_/g, "");
+			if (/[xz?]/i.test(digits)) return null;
+			const radix = base === "b" ? 2 : base === "o" ? 8 : base === "d" ? 10 : 16;
+			try {
+				return BigInt(`${radix === 10 ? "" : radix === 16 ? "0x" : radix === 8 ? "0o" : "0b"}${digits}` || "0").toString(16);
+			} catch {
+				return null;
+			}
+		}
+		if (/^\d+$/.test(tok)) return BigInt(tok).toString(16);
+		return null;
+	};
+
+	const evalSva = (expr: string, env: SvaEnv): boolean | null => {
+		let pos = 0;
+		const s = expr;
+		const ws = () => {
+			while (pos < s.length && /\s/.test(s[pos]!)) pos++;
+		};
+		const peek = (str: string) => s.startsWith(str, pos);
+		const eat = (str: string) => (peek(str) ? ((pos += str.length), true) : false);
+		const identRe = /^[A-Za-z_][\w.]*/;
+		const valueOf = (name: string, map: Map<string, string> | null): string | null =>
+			map ? svaNorm(map.get(name)) : null;
+
+		// Primary → returns a VALUE (string|null) for comparisons; boolean
+		// contexts reduce via svaTruthy.
+		const parsePrimary = (): string | null => {
+			ws();
+			if (eat("(")) {
+				const v = parseOrVal();
+				ws();
+				eat(")");
+				return v;
+			}
+			if (eat("!") || eat("~")) {
+				const v = svaTruthy(parsePrimary());
+				return v === null ? null : v ? "0" : "1";
+			}
+			if (s[pos] === "$") {
+				const fn = /^\$(rose|fell|stable|past)\s*\(\s*([A-Za-z_][\w.]*)\s*\)/.exec(s.slice(pos));
+				if (fn) {
+					pos += fn[0].length;
+					const name = fn[2]!;
+					const cur = valueOf(name, env.cur);
+					const prv = valueOf(name, env.prev);
+					switch (fn[1]) {
+						case "past":
+							return prv;
+						case "stable":
+							return cur !== null && prv !== null ? (cur === prv ? "1" : "0") : null;
+						case "rose": {
+							const c = svaTruthy(cur);
+							const p = svaTruthy(prv);
+							return c === null || p === null ? null : c && !p ? "1" : "0";
+						}
+						case "fell": {
+							const c = svaTruthy(cur);
+							const p = svaTruthy(prv);
+							return c === null || p === null ? null : !c && p ? "1" : "0";
+						}
+					}
+				}
+				return null; // unknown system function
+			}
+			const lit = /^\d*'s?[bodh][0-9a-fx_z?]+|^\d+/i.exec(s.slice(pos));
+			if (lit) {
+				pos += lit[0].length;
+				return svaLiteral(lit[0]);
+			}
+			const id = identRe.exec(s.slice(pos));
+			if (id) {
+				pos += id[0].length;
+				const leaf = id[0].split(".").pop()!;
+				return valueOf(leaf, env.cur);
+			}
+			pos++; // unparseable char — skip so we terminate
+			return null;
+		};
+		const parseEq = (): string | null => {
+			let left = parsePrimary();
+			ws();
+			while (peek("==") || peek("!=")) {
+				const neg = peek("!=");
+				pos += 2;
+				const right = parsePrimary();
+				if (left === null || right === null) left = null;
+				else left = (left === right) !== neg ? "1" : "0";
+				ws();
+			}
+			return left;
+		};
+		const boolBin = (
+			next: () => string | null,
+			opChar: string,
+			apply: (a: boolean, b: boolean) => boolean,
+		) => (): string | null => {
+			let left = next();
+			ws();
+			// Single-char & | ^ but not && / ||.
+			while (s[pos] === opChar && s[pos + 1] !== opChar) {
+				pos++;
+				const right = next();
+				const a = svaTruthy(left);
+				const b = svaTruthy(right);
+				left = a === null || b === null ? null : apply(a, b) ? "1" : "0";
+				ws();
+			}
+			return left;
+		};
+		const parseBitAnd = boolBin(parseEq, "&", (a, b) => a && b);
+		const parseXor = boolBin(parseBitAnd, "^", (a, b) => a !== b);
+		const parseBitOr = boolBin(parseXor, "|", (a, b) => a || b);
+		const parseAnd = (): string | null => {
+			let left = parseBitOr();
+			ws();
+			while (eat("&&")) {
+				const right = parseBitOr();
+				const a = svaTruthy(left);
+				const b = svaTruthy(right);
+				left = a === null || b === null ? null : a && b ? "1" : "0";
+				ws();
+			}
+			return left;
+		};
+		const parseOrVal = (): string | null => {
+			let left = parseAnd();
+			ws();
+			while (eat("||")) {
+				const right = parseAnd();
+				const a = svaTruthy(left);
+				const b = svaTruthy(right);
+				left = a === null || b === null ? null : a || b ? "1" : "0";
+				ws();
+			}
+			return left;
+		};
+		return svaTruthy(parseOrVal());
+	};
+
+	const svaIdentifiers = (expr: string): string[] => {
+		const kKeywords = new Set(["posedge", "negedge", "disable", "iff"]);
+		const out = new Set<string>();
+		// Blank out literals FIRST — `1'b1` would otherwise shed a phantom
+		// identifier `b1` (the token regex starts mid-literal at the base char).
+		const cleaned = expr.replace(/\d*'s?[bodh][0-9a-fx_z?]+/gi, " ");
+		const re = /\$?[A-Za-z_][\w.]*/g;
+		let m: RegExpExecArray | null;
+		while ((m = re.exec(cleaned))) {
+			const tok = m[0];
+			if (tok.startsWith("$")) continue; // $rose(...) — the inner ident matches separately
+			if (kKeywords.has(tok)) continue;
+			out.add(tok.split(".").pop()!);
+		}
+		return [...out];
+	};
+
+	// Resolve a leaf name near `scope` (sibling first, then netlist search).
+	const resolveLeafNear = async (scope: string, name: string): Promise<string | null> => {
+		if (scope) {
+			const item = await document.findTreeItem(`${scope}.${name}`, undefined, undefined);
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			if (item && (item as any).contextValue !== "netlistScope") return `${scope}.${name}`;
+		}
+		const hits = (await traceBackend.searchSignals(name)).filter(
+			(p) => p.split(".").pop() === name,
+		);
+		return hits.sort((a, b) => a.length - b.length)[0] ?? null;
+	};
+
+	// Clock edge times: exact from transition history (FSDB), else a sampled
+	// grid (VCD/FST) — an edge between two samples lands on the later sample.
+	const clockEdges = async (
+		clkPath: string,
+		edge: string,
+	): Promise<{ times: number[]; sampled: boolean }> => {
+		const rising = edge === "posedge";
+		const isHigh = (v: string): boolean | null => {
+			const t = svaTruthy(svaNorm(v));
+			return t;
+		};
+		const vc = await traceBackend.valueChanges!(clkPath, {});
+		if (vc && vc.length) {
+			const times: number[] = [];
+			let prev: boolean | null = null;
+			for (const [t, v] of vc) {
+				const b = isHigh(String(v));
+				if (prev !== null && b !== null && b !== prev && b === rising) times.push(t);
+				if (b !== null) prev = b;
+			}
+			return { times, sampled: false };
+		}
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const tEnd = Number((document as any).metadata?.timeEnd) || 0;
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const minStep = Number((document as any).metadata?.minTimeStep) || 1;
+		const step = Math.max(minStep, Math.ceil(tEnd / 2048));
+		const times: number[] = [];
+		let prev: boolean | null = null;
+		for (let t = 0; t <= tEnd; t += step) {
+			const vals = await traceBackend.valuesAt(t, [clkPath]);
+			const b = vals.length ? isHigh(String(vals[0]!.value ?? "")) : null;
+			if (prev !== null && b !== null && b !== prev && b === rising) times.push(t);
+			if (b !== null) prev = b;
+		}
+		return { times, sampled: true };
+	};
+
+	// First time `path` reads x/z. Exact when the backend has transition
+	// history (FSDB); otherwise a sampled scan — coarse pass over the dump
+	// range, then a binary refine of the first known→x bracket. Sampling can
+	// miss an x pulse narrower than the coarse step; the result says so.
+	const findFirstXTime = async (
+		path: string,
+	): Promise<{ time: number; sampled: boolean } | { neverX: true; sampled: boolean }> => {
+		const changes = await traceBackend.valueChanges!(path, {});
+		if (changes && changes.length) {
+			for (const [t, v] of changes) {
+				if (hasUnknownBits(String(v))) return { time: t, sampled: false };
+			}
+			return { neverX: true, sampled: false };
+		}
+		const valueAt = async (t: number): Promise<string | undefined> => {
+			const vals = await traceBackend.valuesAt(t, [path]);
+			return vals.length ? String(vals[0]!.value ?? "") : undefined;
+		};
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		const tEnd = Number((document as any).metadata?.timeEnd) || 0;
+		if (tEnd <= 0) return { neverX: true, sampled: true };
+		if (hasUnknownBits(await valueAt(0))) return { time: 0, sampled: true };
+		const kSamples = 64;
+		let lo = 0;
+		let hi = -1;
+		for (let i = 1; i <= kSamples; i++) {
+			const t = Math.round((tEnd * i) / kSamples);
+			if (hasUnknownBits(await valueAt(t))) {
+				hi = t;
+				break;
+			}
+			lo = t;
+		}
+		if (hi < 0) return { neverX: true, sampled: true };
+		while (hi - lo > 1) {
+			const mid = Math.floor((lo + hi) / 2);
+			if (hasUnknownBits(await valueAt(mid))) hi = mid;
+			else lo = mid;
+		}
+		return { time: hi, sampled: true };
 	};
 
 	logErr(`standalone-host: parsed ${file} (${fileType}); waiting for webview ready`);
@@ -546,6 +973,322 @@ async function main() {
 				});
 				break;
 			}
+			// Displayed rows (instance paths) from the host's context stream —
+			// the run-diff coordinator uses the ACTIVE run's rows as the compare set.
+			case "getDisplayed": {
+				emit({
+					command: "displayedSignals",
+					requestId: e.requestId,
+					paths: [...displayedInstancePaths()],
+				});
+				break;
+			}
+			// Exact-path batch value read at one time (run diff / assertion eval).
+			// annotateValues resolves loose NAMES; this one takes full paths.
+			case "valuesAt": {
+				const requestId = e.requestId;
+				const time = Number(e.time) || 0;
+				const paths = Array.isArray(e.paths) ? (e.paths as unknown[]).slice(0, 400).map(String) : [];
+				(async () => {
+					const values = await traceBackend.valuesAt(time, paths);
+					emit({
+						command: "valuesAtResult",
+						requestId,
+						time,
+						values: values.map((v) => ({
+							instancePath: v.instancePath,
+							value: v.valueHex ?? String(v.value ?? ""),
+						})),
+					});
+				})().catch((err) => {
+					logErr(`standalone-host: valuesAt failed: ${err instanceof Error ? err.message : err}`);
+					emit({ command: "valuesAtResult", requestId, time, values: [] });
+				});
+				break;
+			}
+			// X-origin hunter: find the FIRST time the signal reads x/z, then
+			// root-cause the unknown with the core tracer's x-mode (follows the
+			// x through the fan-in to undriven / multi-driver / uninitialized-reg
+			// / primary-input / x-select). One command = the whole hunt.
+			case "xOrigin": {
+				const requestId = e.requestId;
+				const path = String(e.instancePath ?? "");
+				const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+				(async () => {
+					const firstX = await findFirstXTime(path);
+					if ("neverX" in firstX) {
+						emit({
+							command: "xOriginResult",
+							requestId,
+							instancePath: path,
+							neverX: true,
+							sampled: firstX.sampled,
+						});
+						return;
+					}
+					const res = await traceSignal(traceBackend, {
+						start: path,
+						time: firstX.time,
+						cwd,
+						mode: "x",
+					});
+					emit({
+						command: "xOriginResult",
+						requestId,
+						instancePath: path,
+						neverX: false,
+						firstXTime: firstX.time,
+						sampled: firstX.sampled,
+						hops: res.hops,
+						stopReason: res.stopReason,
+						xRootCause: res.xRootCause ?? null,
+						mermaid: res.mermaid,
+					});
+				})().catch((err) => {
+					logErr(`standalone-host: xOrigin failed: ${err instanceof Error ? err.message : err}`);
+					emit({
+						command: "xOriginResult",
+						requestId,
+						instancePath: path,
+						error: `x-origin hunt failed: ${err instanceof Error ? err.message : err}`,
+					});
+				});
+				break;
+			}
+			// Assertion-aware check: find SVA assertions in the workspace RTL that
+			// mention the signal's leaf name, evaluate each over the dump at its
+			// clock edges, and report failure times.
+			case "checkAssertions": {
+				const requestId = e.requestId;
+				const path = String(e.instancePath ?? "");
+				const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+				(async () => {
+					const node = normalizeInstancePath(path) ?? path.trim();
+					const leaf = node.split(".").pop() ?? node;
+					const scope = node.split(".").slice(0, -1).join(".");
+					const files = await listRtlFiles(cwd);
+					const leafRe = new RegExp(`\\b${leaf.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
+					const all: SvaAssertion[] = [];
+					for (const f of files) {
+						let content: string;
+						try {
+							content = await readFile(f, "utf8");
+						} catch {
+							continue;
+						}
+						if (!content.includes("assert")) continue;
+						for (const a of parseAssertions(content, f)) {
+							if (leafRe.test(`${a.ante} ${a.conseq} ${a.disable ?? ""}`)) all.push(a);
+						}
+					}
+					const kMaxAssertions = 8;
+					const kMaxEdges = 400;
+					const items: Record<string, unknown>[] = [];
+					for (const a of all.slice(0, kMaxAssertions)) {
+						const base = {
+							label: a.label || `${nodePath.basename(a.file)}:${a.line}`,
+							file: a.file,
+							line: a.line,
+							text: a.text,
+							op: a.op,
+						};
+						if (a.unsupported) {
+							items.push({ ...base, note: "sequence syntax not supported by the native checker" });
+							continue;
+						}
+						const clkPath = await resolveLeafNear(scope, a.clk.split(".").pop()!);
+						if (!clkPath) {
+							items.push({ ...base, note: `clock '${a.clk}' not found in the dump` });
+							continue;
+						}
+						const names = svaIdentifiers(`${a.ante} ${a.conseq} ${a.disable ?? ""}`);
+						const pathFor = new Map<string, string>();
+						const missing: string[] = [];
+						for (const n of names) {
+							const p = await resolveLeafNear(scope, n);
+							if (p) pathFor.set(n, p);
+							else missing.push(n);
+						}
+						if (missing.length) {
+							items.push({ ...base, note: `signals not in dump: ${missing.join(", ")}` });
+							continue;
+						}
+						const { times, sampled } = await clockEdges(clkPath, a.edge);
+						const edges = times.slice(0, kMaxEdges);
+						const failures: number[] = [];
+						let checked = 0;
+						let anteTrue = 0;
+						let unknown = 0;
+						let prev: Map<string, string> | null = null;
+						let pendingA = false;
+						const sigPaths = [...pathFor.values()];
+						for (const t of edges) {
+							const vals = await traceBackend.valuesAt(t, sigPaths);
+							// Raw scalars, NOT valueHex — its "0x" prefix reads as an
+							// unknown bit to hasUnknownBits and skips every edge.
+							const byPath = new Map(vals.map((v) => [v.instancePath, String(v.value ?? "")]));
+							const cur = new Map<string, string>();
+							for (const [n, p] of pathFor) {
+								const v = byPath.get(p);
+								if (v !== undefined) cur.set(n, v);
+							}
+							const env: SvaEnv = { cur, prev };
+							checked++;
+							const disabled = a.disable ? evalSva(a.disable, env) : false;
+							if (disabled === true) {
+								pendingA = false;
+								prev = cur;
+								continue;
+							}
+							if (a.op === "|=>") {
+								if (pendingA) {
+									const b = evalSva(a.conseq, env);
+									if (b === false) failures.push(t);
+									else if (b === null) unknown++;
+								}
+								const aNow = evalSva(a.ante, env);
+								pendingA = aNow === true;
+								if (aNow === true) anteTrue++;
+								else if (aNow === null) unknown++;
+							} else {
+								const aNow = evalSva(a.ante, env);
+								if (aNow === true) {
+									anteTrue++;
+									const b = evalSva(a.conseq, env);
+									if (b === false) failures.push(t);
+									else if (b === null) unknown++;
+								} else if (aNow === null) {
+									unknown++;
+								}
+							}
+							prev = cur;
+							if (failures.length >= 20) break;
+						}
+						const notes: string[] = [];
+						if (sampled) notes.push("clock edges from sampling (VCD has no host-side history)");
+						if (times.length > kMaxEdges) notes.push(`first ${kMaxEdges} of ${times.length} edges checked`);
+						if (anteTrue === 0 && a.op !== "|->") notes.push("antecedent never true (vacuous)");
+						if (anteTrue === 0 && a.op === "|->" && a.ante !== "1'b1") notes.push("antecedent never true (vacuous)");
+						if (unknown > 0) notes.push(`${unknown} edge(s) skipped on x/z`);
+						items.push({
+							...base,
+							clk: a.clk,
+							edge: a.edge,
+							failures,
+							checkedEdges: checked,
+							totalEdges: times.length,
+							note: notes.join("; "),
+						});
+					}
+					emit({
+						command: "assertionResults",
+						requestId,
+						instancePath: path,
+						totalFound: all.length,
+						items,
+					});
+				})().catch((err) => {
+					logErr(`standalone-host: checkAssertions failed: ${err instanceof Error ? err.message : err}`);
+					emit({
+						command: "assertionResults",
+						requestId,
+						instancePath: path,
+						error: `assertion check failed: ${err instanceof Error ? err.message : err}`,
+						items: [],
+					});
+				});
+				break;
+			}
+			// Cone-of-influence: one fan-in level of a signal (from its RTL
+			// driver expression) added as a named waveform group. Recursion =
+			// run it again on a signal inside the group.
+			case "fanInGroup": {
+				const requestId = e.requestId;
+				const path = String(e.instancePath ?? "");
+				const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+				const groupName = String(e.groupName ?? "") || `fan-in: ${path.split(".").pop()}`;
+				(async () => {
+					// Straight to the RTL: every RHS signal of every assignment to the
+					// leaf. Deliberately NOT activeTraceStep — that stops at x sinks /
+					// terminals, and an x sink is exactly where a cone matters.
+					const node = normalizeInstancePath(path) ?? path.trim();
+					const leaf = node.split(".").pop() ?? node;
+					const scope = node.split(".").slice(0, -1).join(".");
+					const assigns = await findAssignments(leaf, cwd, { cache: rtlCacheFor(cwd) });
+					if (!assigns.length) {
+						emit({
+							command: "fanInResult",
+							requestId,
+							instancePath: path,
+							count: 0,
+							note: `no RTL assignment to '${leaf}' found under the workspace`,
+						});
+						return;
+					}
+					const primary = assigns[0]!;
+					const names = [...new Set(assigns.flatMap((a) => a.rhsSignals))].filter(
+						(n) => n && n !== leaf,
+					);
+					const ids: number[] = [];
+					const seenIds = new Set<number>();
+					const unresolved: string[] = [];
+					for (const name of names) {
+						// Sibling in the sink's scope first, then a netlist search
+						// (exact leaf, shortest path wins — same rule as name drops).
+						let item = scope
+							? await document.findTreeItem(`${scope}.${name}`, undefined, undefined)
+							: null;
+						if (!item) {
+							const hits = (await traceBackend.searchSignals(name)).filter(
+								(p) => p.split(".").pop() === name,
+							);
+							const best = hits.sort((a, b) => a.length - b.length)[0];
+							if (best) {
+								item = await document.findTreeItem(best, undefined, undefined);
+							}
+						}
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						const netlistId = (item as any)?.netlistId;
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						if (typeof netlistId === "number" && (item as any)?.contextValue !== "netlistScope") {
+							if (!seenIds.has(netlistId)) {
+								seenIds.add(netlistId);
+								ids.push(netlistId);
+							}
+						} else {
+							unresolved.push(name);
+						}
+					}
+					if (ids.length) {
+						// The webview creates the group (uniquifying the name if it
+						// collides), then the add targets it by name — both messages
+						// travel the same ordered relay, so the group exists first.
+						emit({ command: "newSignalGroup", groupName, showRenameInput: false });
+						await document.renderSignals(ids, [groupName], undefined);
+					}
+					emit({
+						command: "fanInResult",
+						requestId,
+						instancePath: path,
+						group: groupName,
+						count: ids.length,
+						unresolved,
+						driverExpr: primary.rhsExpr ?? "",
+						file: primary.file ?? "",
+						line: primary.line ?? 0,
+					});
+				})().catch((err) => {
+					logErr(`standalone-host: fanInGroup failed: ${err instanceof Error ? err.message : err}`);
+					emit({
+						command: "fanInResult",
+						requestId,
+						instancePath: path,
+						count: 0,
+						note: `fan-in failed: ${err instanceof Error ? err.message : err}`,
+					});
+				});
+				break;
+			}
 			case "removeVariable": {
 				(async () => {
 					let netlistId = typeof e.netlistId === "number" ? (e.netlistId as number) : undefined;
@@ -615,25 +1358,140 @@ async function main() {
 			// renderSignals call the VSCode extension makes.
 			case "handleDrop": {
 				(async () => {
-					const ids: number[] = Array.isArray(e.netlistIdList)
+					// Explicit variable drops (rows the user picked by hand) — always honored.
+					const directIds: number[] = Array.isArray(e.netlistIdList)
 						? (e.netlistIdList as number[]).filter((id) => typeof id === "number")
 						: [];
 					const paths = Array.isArray(e.instancePathList) ? (e.instancePathList as string[]) : [];
+
+					// Scope drops expand to EVERY variable underneath (recursive), with a
+					// hard ceiling: a hierarchy over the limit is blocked outright — no
+					// partial subset — because a giant add is a memory + lead-time trap.
+					// The limit is shared across all scopes in one drop for the same reason.
+					const kMaxScopeSignals = Math.max(
+						1,
+						Number.parseInt(process.env.CRISP_MAX_SCOPE_SIGNALS ?? "", 10) || 2000,
+					);
+					const scopeVars: { id: number; path: string }[] = [];
+					const blockedScopes: string[] = [];
+					let scopesExpanded = 0;
+					let firstScopePath = "";
+					let budget = kMaxScopeSignals;
 					for (const path of paths) {
 						if (typeof path !== "string" || !path) {
 							continue;
 						}
 						const item = await document.findTreeItem(path, undefined, undefined);
+						if (!item) {
+							continue;
+						}
 						// eslint-disable-next-line @typescript-eslint/no-explicit-any
-						const netlistId = (item as any)?.netlistId;
-						if (typeof netlistId === "number") {
-							ids.push(netlistId);
+						if ((item as any).contextValue !== "netlistScope") {
+							// eslint-disable-next-line @typescript-eslint/no-explicit-any
+							const netlistId = (item as any)?.netlistId;
+							if (typeof netlistId === "number") {
+								directIds.push(netlistId);
+							}
+							continue;
+						}
+						// BFS the scope; stop as soon as it exceeds the remaining budget —
+						// the exact total of a huge hierarchy is not worth walking for.
+						const vars: { id: number; path: string }[] = [];
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						const queue: any[] = [item];
+						let overflow = false;
+						while (queue.length > 0 && !overflow) {
+							const scope = queue.shift();
+							const children = await document.getScopeChildren(scope);
+							for (const child of children) {
+								// eslint-disable-next-line @typescript-eslint/no-explicit-any
+								const c = child as any;
+								if (c.contextValue === "netlistScope") {
+									queue.push(child);
+								} else if (typeof c.netlistId === "number") {
+									vars.push({
+										id: c.netlistId,
+										path: typeof c.instancePath === "function" ? String(c.instancePath()) : "",
+									});
+									if (vars.length > budget) {
+										overflow = true;
+										break;
+									}
+								}
+							}
+						}
+						if (overflow) {
+							blockedScopes.push(path);
+							continue;
+						}
+						if (!firstScopePath) {
+							firstScopePath = path;
+						}
+						scopesExpanded++;
+						budget -= vars.length;
+						scopeVars.push(...vars);
+					}
+
+					if (blockedScopes.length > 0) {
+						emit({
+							command: "scopeDropBlocked",
+							blocked: blockedScopes,
+							limit: kMaxScopeSignals,
+						});
+					}
+
+					// Scope expansions skip what is already on screen (a re-drop is a
+					// no-op) and dedupe across scopes; explicit variable drops keep
+					// today's behavior (add what the user grabbed, duplicates included).
+					// Displayed rows come from the host's own context stream — the
+					// document's webviewContext is extension-side plumbing and stays
+					// empty standalone.
+					const displayed = displayedInstancePaths();
+					const seenIds = new Set<number>(directIds);
+					const seenPaths = new Set<string>();
+					const freshScopeIds: number[] = [];
+					for (const v of scopeVars) {
+						if (seenIds.has(v.id) || (v.path && (displayed.has(v.path) || seenPaths.has(v.path)))) {
+							continue;
+						}
+						seenIds.add(v.id);
+						if (v.path) {
+							seenPaths.add(v.path);
+						}
+						freshScopeIds.push(v.id);
+					}
+
+					const ids = directIds.concat(freshScopeIds);
+					const groupPath = Array.isArray(e.groupPath) ? (e.groupPath as string[]) : undefined;
+					const baseIndex = typeof e.dropIndex === "number" ? (e.dropIndex as number) : undefined;
+					// Batched add: each chunk lands (and starts fetching waveform data)
+					// before the next is queued, so the viewer paints early rows while the
+					// rest stream in instead of freezing on one giant synchronous add.
+					const kDropBatch = 200;
+					for (let i = 0; i < ids.length; i += kDropBatch) {
+						const chunk = ids.slice(i, i + kDropBatch);
+						await document.renderSignals(
+							chunk,
+							groupPath,
+							baseIndex === undefined ? undefined : baseIndex + i,
+						);
+						if (ids.length > kDropBatch) {
+							emit({
+								command: "scopeAddProgress",
+								done: Math.min(i + kDropBatch, ids.length),
+								total: ids.length,
+							});
+							await new Promise((resolve) => setImmediate(resolve));
 						}
 					}
-					if (ids.length > 0) {
-						const groupPath = Array.isArray(e.groupPath) ? (e.groupPath as string[]) : undefined;
-						const index = typeof e.dropIndex === "number" ? (e.dropIndex as number) : undefined;
-						await document.renderSignals(ids, groupPath, index);
+					if (scopesExpanded > 0) {
+						emit({
+							command: "scopeAdded",
+							count: freshScopeIds.length,
+							scopes: scopesExpanded,
+							instancePath: firstScopePath,
+							truncated: false,
+						});
 					}
 				})().catch((err) =>
 					logErr(`standalone-host: handleDrop failed: ${err instanceof Error ? err.message : err}`),

@@ -16,7 +16,8 @@ use std::sync::Mutex;
 use crate::host::{DataSink, FileSource, ReadSeek, SourceReader};
 use crate::{
     engine_getchildren, engine_getenumdata, engine_getparametervalues, engine_getsignaldata,
-    engine_getvaluesattime, engine_loadfile, engine_readbody, engine_searchnetlist, engine_unload,
+    engine_getvaluechanges, engine_getvaluesattime, engine_loadfile, engine_readbody,
+    engine_searchnetlist, engine_unload,
 };
 
 /// File-backed [`FileSource`] using positioned (`pread`) reads, so it satisfies
@@ -217,6 +218,9 @@ pub fn get_parameter_values(signal_ids: Vec<u32>) -> String {
 }
 pub fn get_values_at_time(time: u64, paths: String) -> String {
     engine_getvaluesattime(time, paths)
+}
+pub fn get_value_changes(signal_id: u32, start_time: u64, end_time: u64, max_changes: u32) -> String {
+    engine_getvaluechanges(signal_id, start_time, end_time, max_changes)
 }
 pub fn search_netlist(query: String) -> String {
     engine_searchnetlist(query, 0xFFFFFFFF)

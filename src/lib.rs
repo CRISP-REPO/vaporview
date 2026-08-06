@@ -882,32 +882,26 @@ fn engine_getvaluesattime(time: u64, paths: String) -> String {
       let time_index = signal.time_indices();
 
       //log(&format!("Total Time Indices: {:?}", time_index.len()));
+      // crisp_change: build the glitch list as a real Vec and serialize with
+      // serde. The old manual concatenation produced MALFORMED JSON when the
+      // first transition landed exactly on `time` with no prior value
+      // (`[],"0"]`), which downstream JSON.parse consumers choked on.
       let mut i: usize = 0;
-      let mut v = "[]".to_string();
-      let mut last_value = None;
-
+      let mut last_value: Option<String> = None;
+      let mut at_value: Option<String> = None;
       for (_, value) in transitions {
+          if i >= time_index.len() { break; }
           let current_time = time_table[time_index[i] as usize];
-          if current_time > time {
-              if let Some(ref last) = last_value {
-                  v = format!("[\"{}\"]", last);
-              }
-              break;
-          }
-          if current_time == time {
-              if let Some(ref last) = last_value {
-                v = format!("[\"{}\"", last);
-              }
-              v.push_str(&format!(",\"{}\"]", value.to_string()));
-              break;
-          }
-          last_value = Some(value.to_string());
           i += 1;
+          if current_time > time { break; }
+          if current_time == time { at_value = Some(value.to_string()); break; }
+          last_value = Some(value.to_string());
       }
-
-      if v == "[]" && last_value.is_some() {
-          v = format!("[\"{}\"]", last_value.unwrap());
-      }
+      // [prev?, at-t?] — settled value last; "[]" when there is no history ≤ t.
+      let mut value_list: Vec<String> = Vec::new();
+      if let Some(lb) = last_value { value_list.push(lb); }
+      if let Some(av) = at_value { value_list.push(av); }
+      let v = serde_json::to_string(&value_list).unwrap_or_else(|_| "[]".to_string());
 
       result_struct.iter().for_each(|(path, signalid)| {
         if s.index() == signalid.index() {
@@ -923,6 +917,41 @@ fn engine_getvaluesattime(time: u64, paths: String) -> String {
     return result;
 
   }
+
+// crisp_change: full transition history for one signal — JSON [[time,"value"],…].
+// Exact counterpart of what the FSDB reader already offers; gives VCD/FST the
+// same host-side history (first-X scans, sequential-x, clock edges, run diff).
+fn engine_getvaluechanges(signalid: u32, starttime: u64, endtime: u64, maxchanges: u32) -> String {
+    let mut global_signal_source = _signal_source.lock().unwrap();
+    let signal_source = global_signal_source.as_mut().unwrap();
+    let global_hierarchy = _hierarchy.lock().unwrap();
+    let hierarchy = global_hierarchy.as_ref().unwrap();
+    let global_time_table = _time_table.lock().unwrap();
+    let time_table = global_time_table.as_ref().unwrap();
+
+    let signal_ref = match SignalRef::from_index(signalid as usize) {
+        Some(s) => s,
+        None => { return "[]".to_string(); }
+    };
+    let signals_loaded = signal_source.load_signals(&[signal_ref], hierarchy, false);
+    let cap = if maxchanges == 0 { usize::MAX } else { maxchanges as usize };
+    let end = if endtime == 0 { u64::MAX } else { endtime };
+    let mut out: Vec<(u64, String)> = Vec::new();
+    signals_loaded.iter().for_each(|signal| {
+        let time_index = signal.time_indices();
+        let mut i: usize = 0;
+        for (_, value) in signal.iter_changes() {
+            if i >= time_index.len() { break; }
+            let t = time_table[time_index[i] as usize];
+            i += 1;
+            if t < starttime { continue; }
+            if t > end { break; }
+            if out.len() >= cap { break; }
+            out.push((t, value.to_string()));
+        }
+    });
+    serde_json::to_string(&out).unwrap_or_else(|_| "[]".to_string())
+}
 
 fn engine_searchnetlist(searchquery: String, scopeid: u32) -> String {
     let global_hierarchy = _hierarchy.lock().unwrap();
@@ -1017,6 +1046,10 @@ impl Guest for Filecontext {
   fn getenumdata(netlistidlist: Vec<u32>) { engine_getenumdata(&WasmHost, netlistidlist); }
 
   fn getvaluesattime(time: u64, paths: String) -> String { engine_getvaluesattime(time, paths) }
+
+  fn getvaluechanges(signalid: u32, starttime: u64, endtime: u64, maxchanges: u32) -> String {
+    engine_getvaluechanges(signalid, starttime, endtime, maxchanges)
+  }
 
   fn searchnetlist(searchquery: String, scopeid: u32) -> String { engine_searchnetlist(searchquery, scopeid) }
 

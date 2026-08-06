@@ -329,6 +329,22 @@ export class WasmFormatHandler implements WaveformFileParser {
     return JSON.parse(result);
   }
 
+  // crisp_change: full transition history for one signal — same shape the FSDB
+  // handler returns ({ valueChanges: [[time,"value"],…] }), so the tracer's
+  // sequential-x analysis, exact first-X scans and clock-edge extraction work
+  // on VCD/FST too instead of degrading to sampled scans.
+  async getValueChangesForSignal(signalId: SignalId): Promise<any> {
+    if (!this.wasmApi) { return null; }
+    try {
+      const result = await this.wasmApi.getvaluechanges(signalId, BigInt(0), BigInt(0), 0);
+      const arr = JSON.parse(result);
+      if (!Array.isArray(arr)) { return null; }
+      return { valueChanges: arr };
+    } catch {
+      return null;
+    }
+  }
+
   public async searchNetlist(searchString: string, scopeId: number): Promise<NetlistSearchResult> {
     const resultJson = await this.wasmApi!.searchnetlist(searchString, scopeId);
     try {
