@@ -805,18 +805,30 @@ export class VaporviewDocument extends vscode.Disposable implements vscode.Custo
     }));
   }
 
-  public async getValueChangesForPath(instancePath: string): Promise<any> {
+  public async getValueChangesForPath(
+    instancePath: string,
+    opts?: { start?: number; end?: number; max?: number },
+  ): Promise<any> {
     if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath instancePath=' + instancePath); }
     const item = await this.findTreeItem(instancePath, undefined, undefined);
-    if (!item || item.signalId === 0) {
-      if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath: signal not found or signalId=0'); }
+    // signalId 0 is a VALID id — in a VCD it belongs to the first variable
+    // declared, which for most testbenches is the clock. Treating 0 as "not
+    // found" silently denied history to exactly that signal (its trace lane
+    // drew as one flat level, and sequential analysis on it degraded to
+    // "unknown"). Reject a missing item or a SCOPE instead.
+    if (!item || item.signalId === undefined || item.signalId === null || item.signalId < 0) {
+      if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath: signal not found'); }
       return null;
     }
     if (!this._handler.getValueChangesForSignal) {
       if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath: handler does not support getValueChangesForSignal'); }
       return null;
     }
-    const result = await this._handler.getValueChangesForSignal(item.signalId);
+    // Handlers that understand windowing/caps (wasm) take them; the FSDB
+    // handler ignores the extra arg and the host trims client-side.
+    const result = await (this._handler.getValueChangesForSignal as
+      (id: number, o?: { start?: number; end?: number; max?: number }) => Promise<any>)(
+      item.signalId, opts);
     if (VaporviewDocument._dfsdb) { console.log('[FSDB:doc] getValueChangesForPath result: ' + (result ? `${result.valueChanges?.length ?? 0} transitions` : 'null')); }
     return result;
   }

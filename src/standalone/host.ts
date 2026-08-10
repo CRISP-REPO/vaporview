@@ -260,6 +260,12 @@ async function main() {
 	const walks = new Map<string, HostWalk>();
 	let walkCounter = 0;
 
+	// Upper bound on transitions any single history read materializes here.
+	// A clock in a 2 GB dump has millions; the questions this host asks
+	// (first x, clock edges, reg history) all need a bounded PREFIX, not all
+	// of it. Results at the cap are treated as prefixes, never as "all".
+	const kMaxHistoryRead = 200_000;
+
 	// Reduce a viewer value to a settled scalar string. The wasm backend hands
 	// back glitch/edge arrays — sometimes REAL arrays, sometimes STRINGIFIED
 	// (`["0","1"]`), sometimes malformed (`[],"0"]`) — and every host-side
@@ -279,6 +285,14 @@ async function main() {
 			if (m) return m[1]!;
 		}
 		return s;
+	};
+
+	// Data-quality notes from the reads themselves (a truncated history), reported
+	// next to the RTL scan limits so the Trace pane shows everything that bounded
+	// the answer. Deduped and bounded; cumulative for the life of the host.
+	const traceNotes: string[] = [];
+	const traceNote = (n: string): void => {
+		if (!traceNotes.includes(n) && traceNotes.length < 12) traceNotes.push(n);
 	};
 
 	// The tracer's waveform primitives, backed by the OPEN document — the same
@@ -302,19 +316,37 @@ async function main() {
 				.map((h) => String(h.instancePath ?? ""))
 				.filter(Boolean);
 		},
-		// Exact transition history (FSDB only — the wasm handler has no
-		// value-change read, so VCD/FST return null and the tracer degrades to
-		// its structural answer, exactly as documented on the interface).
+		// Exact transition history — FSDB via the reader, VCD/FST/GHW via the wasm
+		// handler's getvaluechanges export. A handler that has neither returns null
+		// and the tracer degrades to its structural answer, as the interface documents.
 		async valueChanges(path, opts) {
+			// Window + cap travel to the handler (both readers honour them, so a
+			// million-transition clock never crosses the boundary); the filters below
+			// still apply for handlers that ignore them.
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			const res = await (document as any).getValueChangesForPath(path);
+			const res = await (document as any).getValueChangesForPath(path, {
+				start: opts?.start,
+				end: opts?.end,
+				max: opts?.max ?? kMaxHistoryRead,
+			});
 			const vc = res?.valueChanges;
 			if (!Array.isArray(vc)) return null;
 			let out = vc as Array<[number, string]>;
 			if (opts?.start !== undefined) out = out.filter(([t]) => t >= (opts.start as number));
 			if (opts?.end !== undefined) out = out.filter(([t]) => t <= (opts.end as number));
+			const cap = opts?.max ?? kMaxHistoryRead;
+			if (res?.truncated || out.length > cap) {
+				// A truncated history is a PREFIX. The tracer degrades on its own, but
+				// the user should be told WHY the answer got vaguer instead of being
+				// left to wonder — same reason RTL scan caps are reported.
+				traceNote(
+					`${path}: only the first ${cap.toLocaleString()} value changes were read — sequential/x history beyond that was not analyzed.`,
+				);
+			}
+			if (out.length > cap) out = out.slice(0, cap);
 			return out;
 		},
+		backendNotes: () => [...traceNotes],
 	};
 
 	// ---- SVA assertion checking (native subset) -------------------------------
@@ -628,16 +660,23 @@ async function main() {
 
 	// Clock edge times: exact from transition history (FSDB), else a sampled
 	// grid (VCD/FST) — an edge between two samples lands on the later sample.
+	/** Edges an assertion check may evaluate (also bounds the clock history read). */
+	const kMaxSvaEdges = 400;
+
 	const clockEdges = async (
 		clkPath: string,
 		edge: string,
-	): Promise<{ times: number[]; sampled: boolean }> => {
+	): Promise<{ times: number[]; sampled: boolean; partial?: boolean }> => {
 		const rising = edge === "posedge";
 		const isHigh = (v: string): boolean | null => {
 			const t = svaTruthy(svaNorm(v));
 			return t;
 		};
-		const vc = await traceBackend.valueChanges!(clkPath, {});
+		// A clock is the HIGHEST-transition signal in any dump — read only as
+		// much history as the edge budget can consume (2 transitions/edge, ×4
+		// headroom for irregular clocks) instead of the whole million.
+		const clkCap = kMaxSvaEdges * 8;
+		const vc = await traceBackend.valueChanges!(clkPath, { max: clkCap });
 		if (vc && vc.length) {
 			const times: number[] = [];
 			let prev: boolean | null = null;
@@ -646,7 +685,9 @@ async function main() {
 				if (prev !== null && b !== null && b !== prev && b === rising) times.push(t);
 				if (b !== null) prev = b;
 			}
-			return { times, sampled: false };
+			// At the cap the history is a PREFIX: the edges are real, but they
+			// are the FIRST N — the caller reports that honestly.
+			return { times, sampled: false, partial: vc.length >= clkCap };
 		}
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const tEnd = Number((document as any).metadata?.timeEnd) || 0;
@@ -671,12 +712,16 @@ async function main() {
 	const findFirstXTime = async (
 		path: string,
 	): Promise<{ time: number; sampled: boolean } | { neverX: true; sampled: boolean }> => {
-		const changes = await traceBackend.valueChanges!(path, {});
+		// Only a PREFIX is needed — the FIRST x is what we are after, and it is
+		// at the front by definition. An x beyond the cap is vanishingly
+		// unlikely and the sampled fallback covers a pathological case.
+		const changes = await traceBackend.valueChanges!(path, { max: kMaxHistoryRead });
 		if (changes && changes.length) {
 			for (const [t, v] of changes) {
 				if (hasUnknownBits(String(v))) return { time: t, sampled: false };
 			}
-			return { neverX: true, sampled: false };
+			// Exhaustive only when the history was NOT truncated.
+			if (changes.length < kMaxHistoryRead) return { neverX: true, sampled: false };
 		}
 		const valueAt = async (t: number): Promise<string | undefined> => {
 			const vals = await traceBackend.valuesAt(t, [path]);
@@ -959,7 +1004,10 @@ async function main() {
 					});
 					walk.chain.push(...seg.hops);
 					walk.done = seg.done;
-					reply(walk, { pending: seg.pending, stopNote: seg.stopNote });
+					// scanNotes = RTL scan LIMITS that bit (file-walk cap, per-name
+					// caps). A truncated scan can masquerade as "no driver", so it
+					// travels to the pane instead of being dropped here.
+					reply(walk, { pending: seg.pending, stopNote: seg.stopNote, scanNotes: seg.scanNotes });
 				})().catch((err) => {
 					logErr(`standalone-host: ${e.command} failed: ${err instanceof Error ? err.message : err}`);
 					emit({
@@ -1006,6 +1054,127 @@ async function main() {
 				});
 				break;
 			}
+			// Real waveform data for a CHAT snapshot: resolve loose names, then
+			// return the windowed transition history for each. The IDE draws a
+			// proper waveform from this instead of showing the ASCII plot the
+			// tracer renders for terminals — same dump, same values, but a
+			// picture the user can actually read at chat-pane width.
+			case "waveSnapshot": {
+				const requestId = e.requestId;
+				const names = Array.isArray(e.signals) ? (e.signals as unknown[]).slice(0, 24).map(String) : [];
+				const start = Number(e.start);
+				const end = Number(e.end);
+				const cursor = Number(e.cursor);
+				// Scope of a known signal from the same trace — lets a bare leaf
+				// ("q") resolve to the RIGHT one in a design with fifty of them.
+				const hintScope = typeof e.hintScope === "string" ? (e.hintScope as string) : "";
+				(async () => {
+					const out: Array<Record<string, unknown>> = [];
+					for (const name of names) {
+						let path = "";
+						if (name.includes(".")) {
+							path = name;
+						} else if (hintScope) {
+							const candidate = `${hintScope}.${name}`;
+							const probe = await traceBackend.valuesAt(cursor, [candidate]);
+							if (probe.length) path = candidate;
+						}
+						if (!path) {
+							// Unique leaf match only — guessing between two `count`s
+							// would draw a waveform of the wrong signal, which is
+							// worse than drawing none.
+							const hits = (await traceBackend.searchSignals(name)).filter(
+								(p) => p.slice(p.lastIndexOf(".") + 1) === name,
+							);
+							if (hits.length === 1) path = hits[0]!;
+						}
+						if (!path) { continue; }
+						const vc = await traceBackend.valueChanges?.(path, { start, end, max: 4000 });
+						// No history (a handler without value-change reads) still gets a
+						// row: the held value across the window, drawn as one segment.
+						const at = await traceBackend.valuesAt(cursor, [path]);
+						const atStart = await traceBackend.valuesAt(start, [path]);
+						// Same radix as the value column and the viewer — raw dump values
+						// are binary, and a bus reading 00111000 next to a cursor value of
+						// 0x38 looks like two different signals.
+						const hex = (v: unknown): string => {
+							const s = scalarize(v);
+							return toHexIfBinary(s) || s;
+						};
+						const trans: Array<[number, string]> = (vc ?? []).map(
+							([t, v]) => [t, hex(v)] as [number, string],
+						);
+						// The value HELD when the window opens: without it the lane starts
+						// blank until the first change inside the window, which reads as
+						// "no data" rather than "unchanged".
+						if (atStart.length && (trans.length === 0 || trans[0]![0] > start)) {
+							trans.unshift([start, hex(atStart[0]!.valueHex ?? atStart[0]!.value)]);
+						}
+						out.push({
+							name,
+							instancePath: path,
+							transitions: vc ? trans : null,
+							valueAtCursor: at.length ? (at[0]!.valueHex ?? String(at[0]!.value ?? "")) : null,
+						});
+					}
+					emit({
+						command: "waveSnapshotResult",
+						requestId,
+						start, end, cursor,
+						// eslint-disable-next-line @typescript-eslint/no-explicit-any
+						timeUnit: String((document as any).metadata?.timeUnit ?? ""),
+						signals: out,
+					});
+				})().catch((err) => {
+					logErr(`standalone-host: waveSnapshot failed: ${err instanceof Error ? err.message : err}`);
+					emit({ command: "waveSnapshotResult", requestId, signals: [] });
+				});
+				break;
+			}
+			// Driver trace against the OPEN document — the value-mode twin of
+			// xOrigin. The agent tools open their OWN reader session for this
+			// (a second FSDB stack that needs its own libs and netlist read,
+			// and fails independently of the viewer you are looking at). This
+			// session already has the file parsed, so run the trace here and
+			// hand the agent a finished chain to explain.
+			case "traceDrivers": {
+				const requestId = e.requestId;
+				const path = String(e.instancePath ?? "");
+				const time = Number(e.time) || 0;
+				const cwd = typeof e.cwd === "string" && e.cwd ? (e.cwd as string) : process.cwd();
+				const mode = e.mode === "x" ? "x" : e.mode === "value" ? "value" : undefined;
+				(async () => {
+					const res = await traceSignal(traceBackend, { start: path, time, cwd, mode });
+					emit({
+						command: "traceDriversResult",
+						requestId,
+						instancePath: path,
+						// `start`/`mermaid` make this payload a complete TraceResult, so a
+						// caller can hand it straight to buildTraceReport (the chat sidecar
+						// does exactly that when the IDE serves a trace on its behalf).
+						start: res.start,
+						startInstancePath: res.startInstancePath,
+						mermaid: res.mermaid,
+						time,
+						mode: res.mode ?? "value",
+						hops: res.hops,
+						stopReason: res.stopReason,
+						needsReasoning: res.needsReasoning ?? null,
+						xRootCause: res.xRootCause ?? null,
+						branchCount: res.branchCount ?? 0,
+						...(res.scanNotes?.length ? { scanNotes: res.scanNotes } : {}),
+					});
+				})().catch((err) => {
+					logErr(`standalone-host: traceDrivers failed: ${err instanceof Error ? err.message : err}`);
+					emit({
+						command: "traceDriversResult",
+						requestId,
+						instancePath: path,
+						error: `trace failed: ${err instanceof Error ? err.message : err}`,
+					});
+				});
+				break;
+			}
 			// X-origin hunter: find the FIRST time the signal reads x/z, then
 			// root-cause the unknown with the core tracer's x-mode (follows the
 			// x through the fan-in to undriven / multi-driver / uninitialized-reg
@@ -1043,6 +1212,10 @@ async function main() {
 						stopReason: res.stopReason,
 						xRootCause: res.xRootCause ?? null,
 						mermaid: res.mermaid,
+						// Same limits the Active Trace reports (RTL scan caps + truncated
+						// history): an x hunt that could not read everything must say so,
+						// or "no x driver found" reads as a conclusion instead of a cap.
+						...(res.scanNotes?.length ? { scanNotes: res.scanNotes } : {}),
 					});
 				})().catch((err) => {
 					logErr(`standalone-host: xOrigin failed: ${err instanceof Error ? err.message : err}`);
@@ -1082,7 +1255,7 @@ async function main() {
 						}
 					}
 					const kMaxAssertions = 8;
-					const kMaxEdges = 400;
+					const kMaxEdges = kMaxSvaEdges;
 					const items: Record<string, unknown>[] = [];
 					for (const a of all.slice(0, kMaxAssertions)) {
 						const base = {
@@ -1113,7 +1286,7 @@ async function main() {
 							items.push({ ...base, note: `signals not in dump: ${missing.join(", ")}` });
 							continue;
 						}
-						const { times, sampled } = await clockEdges(clkPath, a.edge);
+						const { times, sampled, partial } = await clockEdges(clkPath, a.edge);
 						const edges = times.slice(0, kMaxEdges);
 						const failures: number[] = [];
 						let checked = 0;
@@ -1167,6 +1340,9 @@ async function main() {
 						const notes: string[] = [];
 						if (sampled) notes.push("clock edges from sampling (VCD has no host-side history)");
 						if (times.length > kMaxEdges) notes.push(`first ${kMaxEdges} of ${times.length} edges checked`);
+						// The clock history itself was capped — say so rather than
+						// implying the whole run was covered.
+						if (partial) notes.push("clock history capped — only the earliest edges were read");
 						if (anteTrue === 0 && a.op !== "|->") notes.push("antecedent never true (vacuous)");
 						if (anteTrue === 0 && a.op === "|->" && a.ante !== "1'b1") notes.push("antecedent never true (vacuous)");
 						if (unknown > 0) notes.push(`${unknown} edge(s) skipped on x/z`);

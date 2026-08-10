@@ -222,7 +222,14 @@ export class RowHandler {
       this.events.reorderSignals(moveList, groupId, moveIndex);
     }
 
-    this.events.signalSelect(rowIdList, lastRowId);
+    // Selecting every added row is a useful cue for a handful of signals, but a
+    // SCOPE drop adds hundreds — leaving a wall of highlighted rows. Past a
+    // small threshold, mark only the last added row as current.
+    const kMaxAutoSelect = 8;
+    const autoSelect = rowIdList.length > kMaxAutoSelect
+      ? [rowIdList[rowIdList.length - 1]!]
+      : rowIdList;
+    this.events.signalSelect(autoSelect, lastRowId);
 
     //console.log('addVariable');
     vscodeWrapper.sendWebviewContext(StateChangeType.User);

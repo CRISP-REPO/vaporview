@@ -333,13 +333,25 @@ export class WasmFormatHandler implements WaveformFileParser {
   // handler returns ({ valueChanges: [[time,"value"],…] }), so the tracer's
   // sequential-x analysis, exact first-X scans and clock-edge extraction work
   // on VCD/FST too instead of degrading to sampled scans.
-  async getValueChangesForSignal(signalId: SignalId): Promise<any> {
+  async getValueChangesForSignal(
+    signalId: SignalId,
+    opts?: { start?: number; end?: number; max?: number },
+  ): Promise<any> {
     if (!this.wasmApi) { return null; }
+    // ALWAYS bounded: a clock in a large dump has millions of transitions, and
+    // an uncapped read materializes every one of them as JSON (string, parse,
+    // array) on the host — hundreds of MB for a question that needs a prefix.
+    const cap = Math.max(1, Math.min(opts?.max ?? 200_000, 2_000_000));
     try {
-      const result = await this.wasmApi.getvaluechanges(signalId, BigInt(0), BigInt(0), 0);
+      const result = await this.wasmApi.getvaluechanges(
+        signalId,
+        BigInt(Math.max(0, Math.floor(opts?.start ?? 0))),
+        BigInt(Math.max(0, Math.floor(opts?.end ?? 0))), // 0 = to the end
+        cap,
+      );
       const arr = JSON.parse(result);
       if (!Array.isArray(arr)) { return null; }
-      return { valueChanges: arr };
+      return { valueChanges: arr, truncated: arr.length >= cap };
     } catch {
       return null;
     }

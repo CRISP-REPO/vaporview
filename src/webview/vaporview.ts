@@ -146,12 +146,15 @@ export function handleClickSelection(event: MouseEvent, rowId: RowId) {
     } else {
       newSelection = viewerState.selectedSignal.concat([rowId]);
     }
-  } else if (viewerState.selectedSignal.includes(rowId)) {
-    // Plain click on an already-selected row keeps the whole selection intact so
-    // drag-and-drop of the row (or a multi-selection) is never interrupted. To
-    // deselect, click an unselected row, or press Ctrl/Cmd+A to toggle all off.
-    newSelection = viewerState.selectedSignal;
   } else {
+    // Plain click ALWAYS collapses to the clicked row — including a row that is
+    // already part of a multi-selection (Explorer/Finder/VS Code behaviour).
+    // Keeping the selection intact here (an earlier attempt to protect drags)
+    // made a bulk add unclearable: every added row was selected, so clicking
+    // any of them was a click *inside* the selection and the highlight never
+    // went away. Drags are unaffected — the labels panel applies selection on
+    // CLICK and suppresses it after a drag (dragInProgress / dragEndedAt), and
+    // the canvas has no row drag.
     newSelection = [rowId];
   }
   events.signalSelect(newSelection, rowId);
@@ -308,10 +311,13 @@ class VaporviewWebview {
     const mouseMode = !config.autoTouchpadScrolling && !config.touchpadScrolling;
 
     if (e.shiftKey) {
+      // SHIFT + wheel = HORIZONTAL, the browser/VS Code convention: pan the
+      // time axis. (This used to be the vertical-scroll modifier, with plain
+      // wheel panning time — the reverse of every other pane, so the gesture
+      // changed meaning the moment the pointer crossed from the signal list
+      // into the waveform.)
       e.stopPropagation();
-      this.scrollArea.scrollTop      += deltaY || deltaX;
-      this.labelsScroll.scrollTop     = this.scrollArea.scrollTop;
-      this.valuesScroll.scrollTop = this.scrollArea.scrollTop;
+      this.viewport.handleScrollEvent(this.viewport.pseudoScrollLeft + (deltaY || deltaX));
     } else if (e.ctrlKey || (e.metaKey && config.os === OS.Mac)) {
       if      (this.viewport.updatePending) {return;}
       // Touchpad mode detection returns false positives with pinches, so we
@@ -341,16 +347,18 @@ class VaporviewWebview {
       //  this.viewport.handleScrollEvent(this.viewport.pseudoScrollLeft + deltaY);
       //}
 
-      const isTouchpad = config.autoTouchpadScrolling ? this.isTouchpad(e) : config.touchpadScrolling;
+      // Plain wheel scrolls THROUGH THE SIGNALS, exactly like it does over the
+      // label and value panes — one gesture, one meaning, wherever the pointer
+      // is. Horizontal intent (a touchpad's deltaX) still pans time, and both
+      // axes can arrive together on a touchpad, so neither is exclusive.
       this.touchpadCheckTimer = performance.now() + 100;
-
-      if (e.deltaX !== 0 || isTouchpad) {
+      if (deltaX !== 0) {
         this.viewport.handleScrollEvent(this.viewport.pseudoScrollLeft + deltaX);
-        this.scrollArea.scrollTop  += e.deltaY;
+      }
+      if (deltaY !== 0) {
+        this.scrollArea.scrollTop  += deltaY;
         this.labelsScroll.scrollTop = this.scrollArea.scrollTop;
         this.valuesScroll.scrollTop = this.scrollArea.scrollTop;
-      } else {
-        this.viewport.handleScrollEvent(this.viewport.pseudoScrollLeft + deltaY);
       }
     }
   }
