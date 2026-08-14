@@ -217,6 +217,31 @@ export class FsdbFormatHandler implements WaveformFileParser {
     timeUnit: "ns",
   };
 
+  // ---- IDE profile (CRISP_IDE_PROFILE=1): wall-clock per WORKER COMMAND —
+  // openFsdb / readScopes / readMetadata / signal reads — plus the callback
+  // volume readScopes generates (every var is one IPC message; on a big FSDB
+  // that count IS the story). Drained by the host into its profile report.
+  private profBuckets = new Map<string, { ms: number; calls: number }>();
+  private profVarCallbacks = 0;
+  private profScopeCallbacks = 0;
+  private profBucket(label: string, ms: number): void {
+    if (process.env.CRISP_IDE_PROFILE !== "1") { return; }
+    const b = this.profBuckets.get(label) ?? { ms: 0, calls: 0 };
+    b.ms += ms;
+    b.calls += 1;
+    this.profBuckets.set(label, b);
+  }
+  /** Hand the accumulated buckets to the host and reset. */
+  takeProfileBuckets(): Map<string, { ms: number; calls: number }> {
+    const out = new Map(this.profBuckets);
+    if (this.profVarCallbacks || this.profScopeCallbacks) {
+      out.set("fsdb:tree-callbacks", { ms: 0, calls: this.profVarCallbacks + this.profScopeCallbacks });
+      out.set("fsdb:var-callbacks", { ms: 0, calls: this.profVarCallbacks });
+    }
+    this.profBuckets = new Map();
+    return out;
+  }
+
   constructor(
     providerDelegate: VaporviewDocumentDelegate,
     uri: vscode.Uri,
@@ -1017,7 +1042,13 @@ export class FsdbFormatHandler implements WaveformFileParser {
       // Local Linux path: auto-build addon + fork worker
       const vaporviewRoot = path.resolve(__dirname, '..');
       log(`[FSDB] load: __dirname=${__dirname}, vaporviewRoot=${vaporviewRoot}, fsdbReaderLibsPath=${fsdbReaderLibsPath}`);
-      const addonReady = await this.ensureFsdbAddon(vaporviewRoot, fsdbReaderLibsPath);
+      const profAddonStart = Date.now();
+    const addonReady = await this.ensureFsdbAddon(vaporviewRoot, fsdbReaderLibsPath);
+    if (process.env.CRISP_IDE_PROFILE === "1") {
+      log(`[profile]   fsdb:ensureAddon ${Date.now() - profAddonStart}ms (ready=${addonReady}) — ` +
+          `a first open BUILDS the native addon here (node-gyp), which can dominate everything else`);
+      this.profBucket('fsdb:ensureAddon', Date.now() - profAddonStart);
+    }
       log(`[FSDB] load: ensureFsdbAddon returned ${addonReady}`);
       if (!addonReady) {
         log(`[FSDB] load: addon not ready — aborting load`);
@@ -1160,6 +1191,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
         break;
       }
       case 'fsdb-scope-callback': {
+        this.profScopeCallbacks++;
         this.fsdbScopeCallback(message.name, message.type, message.path, message.netlistId, message.scopeOffsetIdx);
         break;
       }
@@ -1185,6 +1217,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
         break;
       }
       case 'fsdb-var-callback': {
+        this.profVarCallbacks++;
         this.fsdbVarCallback(
           message.name, message.type, message.encoding, message.path, message.netlistId, message.signalId, message.width, message.msb, message.lsb);
         break;
@@ -1209,6 +1242,15 @@ export class FsdbFormatHandler implements WaveformFileParser {
     return new Promise((resolve, reject) => {
       const id = Math.random().toString(36).substring(2, 9);
       message.id = id;
+      const profDone = (() => {
+        const start = Date.now();
+        let fired = false;
+        return () => {
+          if (fired) { return; }
+          fired = true;
+          this.profBucket(`fsdb:worker:${message.command}`, Date.now() - start);
+        };
+      })();
       if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] command=${message.command} id=${id} mode=${this.isSSHRemote ? 'SSH' : 'IPC'}`); }
       const taskStartTime = Date.now();
 
@@ -1219,6 +1261,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
             const idx = this.stdioMessageListeners.indexOf(handler);
             if (idx >= 0) { this.stdioMessageListeners.splice(idx, 1); }
             if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] response for ${message.command} id=${id} elapsed=${Date.now() - taskStartTime}ms`); }
+            profDone();
             if (msg.error) {
               if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${msg.error}`); }
               return reject(new Error(String(msg.error)));
@@ -1236,6 +1279,7 @@ export class FsdbFormatHandler implements WaveformFileParser {
           if ('id' in msg && msg.id === id) {
             this.fsdbWorker!.off('message', messageHandler);
             if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] IPC response id=${id} elapsed=${Date.now() - taskStartTime}ms`); }
+            profDone();
             if (msg.error) {
               if (_dwf) { this.providerDelegate.logOutputChannel(`[WF:callTask] ERROR: ${msg.error}`); }
               return reject(new Error(String(msg.error)));

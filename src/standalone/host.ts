@@ -81,6 +81,34 @@ async function main() {
 	console.info = console.log;
 
 	const { file, stateDir: stateDirArg } = parseArgs(process.argv.slice(2));
+
+	// ---- IDE profile (CRISP_IDE_PROFILE=1) --------------------------------
+	// Milestones of the open→display pipeline, mirrored after the CLI's
+	// TraceProfiler: wall-clock attributed to phases so the bottleneck is a
+	// number, not a feeling. Marks go to stderr (the desktop forwards host
+	// stderr into its app log, so BOTH sides of the pipeline land in one file)
+	// and are kept for the profileReport command.
+	const profEnabled = process.env.CRISP_IDE_PROFILE === "1";
+	const profT0 = Date.now();
+	let profPrev = profT0;
+	const profMarks: Array<{ label: string; atMs: number; deltaMs: number }> = [];
+	const profBuckets = new Map<string, { ms: number; calls: number }>();
+	const profMark = (label: string): void => {
+		if (!profEnabled) return;
+		const now = Date.now();
+		const mark = { label, atMs: now - profT0, deltaMs: now - profPrev };
+		profPrev = now;
+		profMarks.push(mark);
+		logErr(`[profile] +${String(mark.atMs).padStart(6)}ms  (Δ ${String(mark.deltaMs).padStart(5)}ms)  ${label}`);
+	};
+	const profBucket = (label: string, ms: number): void => {
+		if (!profEnabled) return;
+		const b = profBuckets.get(label) ?? { ms: 0, calls: 0 };
+		b.ms += ms;
+		b.calls += 1;
+		profBuckets.set(label, b);
+	};
+	profMark("host start (node up, args parsed)");
 	if (!file) {
 		logErr("standalone-host: missing --file <path>");
 		process.exit(2);
@@ -150,6 +178,7 @@ async function main() {
 		// / VERDI_HOME) and forks dist/fsdb_worker.js next to this bundle.
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		handler = new FsdbFormatHandler(delegate as any, uri as any, async () => null);
+		profMark("fsdb handler constructed");
 	} else {
 		// Locate sibling build artifacts relative to this bundle (dist/).
 		const wasmWorkerFile = nodePath.join(__dirname, "worker.js");
@@ -158,6 +187,7 @@ async function main() {
 		let wasmModule: WebAssembly.Module;
 		try {
 			wasmModule = await WebAssembly.compile(new Uint8Array(await readFile(wasmPath)));
+			profMark("wasm compiled");
 		} catch (e) {
 			logErr(`standalone-host: failed to load wasm at ${wasmPath}: ${e instanceof Error ? e.message : e}`);
 			process.exit(3);
@@ -169,18 +199,32 @@ async function main() {
 			logErr(`standalone-host: failed to create handler: ${e instanceof Error ? e.message : e}`);
 			process.exit(4);
 		}
+		profMark("wasm handler created (worker thread up)");
 	}
 
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	const document = await VaporviewDocument.create(uri as any, handler as any, delegate as any, collection as any);
 
 	// Parse the file (netlist + body). This sets metadata.timeTableLoaded.
+	profMark("parse start (document.load — netlist, metadata, time table)");
 	try {
 		await document.load();
 	} catch (e) {
 		logErr(`standalone-host: failed to parse ${file}: ${e instanceof Error ? e.message : e}`);
 		emit({ command: "showMessage", messageType: "error", message: `Failed to parse ${file}` });
 		process.exit(5);
+	}
+
+	profMark(`parse done — netlist + metadata (${document.metadata.netlistIdCount ?? "?"} vars)`);
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	if (profEnabled && typeof (handler as any).takeProfileBuckets === "function") {
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		for (const [label, b] of (handler as any).takeProfileBuckets() as Map<string, { ms: number; calls: number }>) {
+			profBucket(label, b.ms);
+			const bb = profBuckets.get(label)!;
+			bb.calls = b.calls; // preserve the real call count, not 1
+			logErr(`[profile]   bucket ${label}: ${b.ms}ms over ${b.calls} call(s)`);
+		}
 	}
 
 	// FsdbFormatHandler.loadNetlist reports failures via showErrorMessage and
@@ -768,15 +812,32 @@ async function main() {
 
 		switch (e.command) {
 			case "ready":
+				profMark("webview ready → initViewport posted");
 				// metadata.timeTableLoaded is already true → posts initViewport
 				// + setConfigSettings immediately.
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any
 				document.onWebviewReady(fakePanel as any);
 				break;
-			case "fetchDataFromFile":
+			case "fetchDataFromFile": {
+				const fetchStart = Date.now();
 				// eslint-disable-next-line @typescript-eslint/no-explicit-any
-				document.fetchData(e.requestList as any);
+				const p = Promise.resolve(document.fetchData(e.requestList as any));
+				if (profEnabled) {
+					void p.then(() => {
+						profBucket("host:fetchSignalData", Date.now() - fetchStart);
+						if (!profMarks.some((m) => m.label.startsWith("first signal data"))) {
+							profMark(`first signal data served (${Date.now() - fetchStart}ms)`);
+						}
+					});
+				}
 				break;
+			}
+			case "profileReport": {
+				const buckets: Record<string, { ms: number; calls: number }> = {};
+				for (const [k, v] of profBuckets) buckets[k] = v;
+				emit({ command: "profileReport", requestId: e.requestId, enabled: profEnabled, marks: profMarks, buckets });
+				break;
+			}
 			case "logOutput":
 				logErr(String(e.message ?? ""));
 				break;
@@ -1487,6 +1548,9 @@ async function main() {
 			// list against the freshly parsed netlist, exactly like VS Code's
 			// StateChangeType.Restore path.
 			case "contextUpdate": {
+				if (profEnabled && !profMarks.some((m) => m.label.startsWith("first contextUpdate"))) {
+					profMark("first contextUpdate (rows live in the webview)");
+				}
 				const ctx: Record<string, unknown> = { ...e };
 				delete ctx.command;
 				lastContext = ctx;
