@@ -58,7 +58,41 @@ function emit(message: Record<string, unknown>): void {
 	process.stdout.write(JSON.stringify(message) + "\n");
 }
 
+// Host stderr is the desktop's app-log feed AND, when the desktop is started
+// from a shell, the user's terminal. Two classes of line go through here:
+//   - PROBLEMS the user must see: failures, "unknown command", missing libs.
+//   - CHATTER nobody asked for: "[FSDB] checking addon at …", vaporview's own
+//     progress narration, "[profile]" marks. Field feedback: "many lines are
+//     printed on the shell and those never helped me".
+// Chatter is emitted only when CRISP_DEV_DEBUG_WF=1 (the same switch the
+// FSDB handler already keys its verbose logging on) or CRISP_IDE_PROFILE=1
+// for the profile marks. Problems always go out.
+const HOST_VERBOSE = process.env.CRISP_DEV_DEBUG_WF === "1";
+const HOST_PROFILE = process.env.CRISP_IDE_PROFILE === "1";
+function isChatter(message: string): boolean {
+	if (message.startsWith("[profile]")) return !HOST_PROFILE;
+	if (HOST_VERBOSE) return false;
+	// Prefixes vaporview uses for narration (not failure) — bracketed subsystem
+	// tags and the standalone-host progress lines that carry no "failed"/"error".
+	const lower = message.toLowerCase();
+	const alarming = /\b(fail|error|cannot|missing|not found|unknown command|malformed|crash|abort)\b/.test(lower);
+	if (alarming) return false;
+	return /^\[(FSDB|WF|DND|FSDB:SSH|FSDB:doc)[^\]]*\]/.test(message)
+		|| message.startsWith("standalone-host: parsed ")
+		|| message.startsWith("standalone-host: loading session")
+		|| message.startsWith("Start FSDB worker")
+		// vaporview's own load narration (document.ts / wasm handler): the
+		// progress a VS Code output channel shows, meaningless on a shell.
+		|| message.startsWith("Using nodeFs")
+		|| message.startsWith("Finished parsing")
+		|| message.startsWith("Scope count:")
+		|| message.startsWith("Loading parameters")
+		|| message.startsWith("Loading signals")
+		|| /^Loaded \d+ signals?/.test(message)
+		|| message.startsWith("Total Value Change Events");
+}
 function logErr(message: string): void {
+	if (isChatter(message)) return;
 	process.stderr.write(message + "\n");
 }
 
